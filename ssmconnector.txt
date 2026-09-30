@@ -1,0 +1,5 @@
+SSM Connector — Module natif PrestaShop 8/9
+Connecteur Selest Site Manager (inventaire + MAJ + logs + sécurité)
+Version 0.2.0 — Sprint 5
+Auteur : Selest Informatique
+Privé — réservé aux clients Selest
