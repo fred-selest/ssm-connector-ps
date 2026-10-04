@@ -3,6 +3,7 @@
  * SSM Connector — module natif PrestaShop 8/9
  *
  * @author  Selest Informatique
+ * @license MIT
  * @version 0.3.0
  */
 

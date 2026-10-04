@@ -70,4 +70,4 @@ find . -name '*.php' -not -path './.git/*' -exec php -l {} \;
 
 ## Licence
 
-À définir.
+[MIT](LICENSE) © Selest Informatique

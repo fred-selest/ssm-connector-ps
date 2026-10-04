@@ -2,3 +2,4 @@ SSM Connector — Module natif PrestaShop 8/9
 Connecteur Selest Site Manager (inventaire + heartbeat + événements)
 Version 0.3.0
 Auteur : Selest Informatique
+Licence : MIT
