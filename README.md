@@ -4,7 +4,7 @@
 
 Module natif PrestaShop (8.x, 9.x visé) qui relie la boutique à **SSM Core** (Selest Site Manager) : inventaire (modules, thèmes, versions), statistiques de base, journal d'événements et suivi de l'état de la boutique.
 
-Version actuelle : **0.4.0**
+Version actuelle : **0.4.1**
 
 ## Aperçu
 
@@ -21,8 +21,10 @@ Page de configuration du module : trois champs, un test de connexion intégré e
 ## Configuration en 3 étapes
 
 1. **Installer** le module : Back-office → Modules → Gestionnaire de modules → *Téléverser un module*, avec `ssmconnector.zip` de la [dernière release](../../releases/latest).
-2. **Ouvrir la configuration** du module, coller l'**adresse de SSM Core**, cliquer sur **Enregistrer et tester la connexion**.
-3. **Copier le token** affiché (bouton *Copier*) et ajouter la boutique dans le tableau de bord SSM avec ce token.
+2. **Dans le tableau de bord SSM**, ajouter la boutique : SSM Core affiche l'adresse du serveur et génère un **token** pour cette boutique. Copiez-les.
+3. **Dans la configuration du module**, collez l'**adresse** et le **token**, puis cliquez sur **Enregistrer et tester la connexion**.
+
+> Si votre SSM Core accepte un token personnalisé, vous pouvez à la place copier dans SSM celui généré par le module (bouton *Copier*, à l'étape 2 de la page de configuration). Dans tous les cas, le token doit être **identique des deux côtés**.
 
 C'est tout : l'envoi est automatique, sans tâche cron à configurer. La page indique l'état de la connexion ; en cas d'échec, elle explique la cause (adresse introuvable, token refusé, certificat invalide…) et ce qu'il faut corriger.
 
@@ -58,7 +60,7 @@ Le heartbeat n'est envoyé que si l'intervalle configuré est écoulé ; ajouter
 ## Sécurité
 
 - **HTTPS obligatoire** : l'adresse de SSM Core doit commencer par `https://` (`http://` n'est toléré que pour `localhost`). Le certificat est vérifié et les redirections ne sont **pas** suivies, pour que le token ne parte jamais vers une autre adresse.
-- **Token** de 256 bits tiré au hasard à l'installation, affiché masqué, **régénérable** en un clic (l'ancien est alors refusé).
+- **Token** : celui fourni par SSM Core (saisi à l'étape 2) ; à défaut, un token de 256 bits tiré au hasard à l'installation. Affiché masqué, remplaçable à tout moment. Seuls les caractères ASCII visibles sont acceptés (16 à 512, sans espace ni retour à la ligne), ce qui exclut toute injection dans les en-têtes HTTP.
 - **Chaque envoi** porte le token (`X-SSM-Token`) et une signature HMAC-SHA256 du corps (`X-SSM-Signature`, clé = token). Le corps contient un horodatage, donc signé.
 - **Point d'entrée cron** : token en en-tête uniquement, comparaison à temps constant, **blocage 15 minutes après 10 échecs** depuis la même adresse IP (réponse `429`). L'adresse IP n'est jamais stockée en clair, seulement son condensat.
 - **Back-office** : chaque action de la page de configuration est protégée par un jeton anti-CSRF propre à l'employé, en plus de celui de PrestaShop ; toutes les sorties sont échappées. L'accès à la page reste régi par les droits PrestaShop sur les modules.

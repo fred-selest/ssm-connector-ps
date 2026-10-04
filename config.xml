@@ -2,7 +2,7 @@
 <module>
     <name>ssmconnector</name>
     <displayName><![CDATA[SSM Connector]]></displayName>
-    <version><![CDATA[0.4.0]]></version>
+    <version><![CDATA[0.4.1]]></version>
     <description><![CDATA[Connecteur SSM (Selest Site Manager) — inventaire, MAJ, logs, sécurité.]]></description>
     <author><![CDATA[Selest Informatique]]></author>
     <tab><![CDATA[administration]]></tab>
