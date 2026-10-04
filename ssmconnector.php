@@ -4,7 +4,7 @@
  *
  * @author  Selest Informatique
  * @license MIT
- * @version 0.4.1
+ * @version 0.4.2
  */
 
 if (!defined('_PS_VERSION_')) {
@@ -20,6 +20,10 @@ class Ssmconnector extends Module
     const LOCK_TTL = 120;
     const CRON_MAX_FAILURES = 10;
     const CRON_WINDOW = 900;
+    const TOKEN_MIN = 32;           // minimum exigé par SSM Core
+    const TOKEN_MAX = 256;
+    const AUTO_TIMEOUT = 5;         // secondes : envoi automatique (ne doit jamais retenir longtemps une page)
+    const EVENT_THROTTLE = 60;      // secondes : un même événement n'est pas répété plus vite
     const UPDATE_REPO = 'fred-selest/ssm-connector-ps';
     const UPDATE_TTL = 43200;
 
@@ -27,14 +31,14 @@ class Ssmconnector extends Module
     {
         $this->name = 'ssmconnector';
         $this->tab = 'administration';
-        $this->version = '0.4.1';
+        $this->version = '0.4.2';
         $this->author = 'Selest Informatique';
         $this->need_instance = 0;
         $this->ps_versions_compliancy = ['min' => '8.0.0', 'max' => _PS_VERSION_];
         $this->bootstrap = true;
         parent::__construct();
         $this->displayName = $this->l('SSM Connector');
-        $this->description = $this->l('Connecteur SSM (Selest Site Manager) — inventaire, MAJ, logs, sécurité.');
+        $this->description = $this->l('Connecteur SSM (Selest Site Manager) : envoie l\'inventaire de la boutique à SSM Core, sans rien modifier.');
     }
 
     public function install()
@@ -82,28 +86,27 @@ class Ssmconnector extends Module
             $this->setPendingEvents([]);
         }
 
-        return $this->generateToken()
-            && $this->registerHooks();
+        return $this->registerHooks();
     }
 
-    private function generateToken()
-    {
-        if (!Configuration::get('SSM_CONNECTOR_TOKEN')) {
-            Configuration::updateValue('SSM_CONNECTOR_TOKEN', bin2hex(random_bytes(32)));
-        }
-        return true;
-    }
-
+    /**
+     * Crochets réellement déclenchés par PrestaShop (vérifiés dans le code source du cœur) :
+     * actionAuthenticationBefore / actionAuthentication (connexion client), actionValidateOrder (commande),
+     * actionProductUpdate, actionModuleInstallAfter / actionModuleUninstallAfter, displayHeader, displayBackOfficeTop.
+     * Les anciens noms (actionCustomerLoginBefore/After, actionEmployeeLoginAfter, actionOrderCreated, displayBackOfficeHeader)
+     * n'existent pas dans PrestaShop : ils sont détachés.
+     */
     private function registerHooks()
     {
-        if ($this->isRegisteredInHook('displayBackOfficeHeader')) {
-            $this->unregisterHook('displayBackOfficeHeader');
+        foreach (['displayBackOfficeHeader', 'actionCustomerLoginBefore', 'actionCustomerLoginAfter', 'actionEmployeeLoginAfter', 'actionOrderCreated'] as $obsolete) {
+            if ($this->isRegisteredInHook($obsolete)) {
+                $this->unregisterHook($obsolete);
+            }
         }
 
-        return $this->registerHook('actionCustomerLoginBefore')
-            && $this->registerHook('actionCustomerLoginAfter')
-            && $this->registerHook('actionEmployeeLoginAfter')
-            && $this->registerHook('actionOrderCreated')
+        return $this->registerHook('actionAuthenticationBefore')
+            && $this->registerHook('actionAuthentication')
+            && $this->registerHook('actionValidateOrder')
             && $this->registerHook('actionProductUpdate')
             && $this->registerHook('actionModuleInstallAfter')
             && $this->registerHook('actionModuleUninstallAfter')
@@ -134,34 +137,26 @@ class Ssmconnector extends Module
         return '';
     }
 
-    public function hookActionCustomerLoginAfter($params)
+    /** Connexion client réussie (le cœur fournit le client dans $params['customer']). */
+    public function hookActionAuthentication($params)
     {
-        $this->queueEvent('customer_login', ['id_customer' => isset($params['customer']->id) ? $params['customer']->id : null]);
+        $this->queueEvent('customer_login', ['id_customer' => isset($params['customer']->id) ? (int) $params['customer']->id : null]);
     }
 
-    public function hookActionCustomerLoginBefore($params)
+    /** Tentative de connexion client : aucun paramètre fourni par le cœur, donc aucune donnée personnelle. */
+    public function hookActionAuthenticationBefore($params)
     {
-        $this->queueEvent('customer_login_attempt', [
-            'email_hash' => isset($params['email']) ? substr(hash('sha256', $params['email']), 0, 8) : null,
-        ]);
+        $this->queueEvent('customer_login_attempt', [], true);
     }
 
-    public function hookActionEmployeeLoginAfter($params)
+    public function hookActionValidateOrder($params)
     {
-        $this->queueEvent('employee_login', [
-            'id_employee' => isset($params['employee']->id) ? $params['employee']->id : null,
-            'profile' => isset($params['employee']->id_profile) ? $params['employee']->id_profile : null,
-        ]);
-    }
-
-    public function hookActionOrderCreated($params)
-    {
-        $this->queueEvent('order_created', ['id_order' => isset($params['order']->id) ? $params['order']->id : null]);
+        $this->queueEvent('order_created', ['id_order' => isset($params['order']->id) ? (int) $params['order']->id : null]);
     }
 
     public function hookActionProductUpdate($params)
     {
-        $this->queueEvent('product_update', ['id_product' => isset($params['product']->id) ? $params['product']->id : null]);
+        $this->queueEvent('product_update', ['id_product' => isset($params['product']->id) ? (int) $params['product']->id : null]);
     }
 
     public function hookActionModuleInstallAfter($params)
@@ -190,20 +185,21 @@ class Ssmconnector extends Module
         $error = (string) Configuration::get('SSM_LAST_ERROR');
         $nonce = '<input type="hidden" name="ssm_nonce" value="' . $this->h($this->nonce()) . '">';
 
-        $output .= $this->renderStatus($url, $ok, $last, $error, $auto, $update);
+        $output .= $this->renderStatus($url, $token, $ok, $last, $error, $auto, $update);
 
-        // Étapes 1 à 3 : un seul formulaire
+        // Étapes 1 à 3 : un seul formulaire. Le token n'est jamais réécrit dans la page (4 derniers caractères seulement).
         $output .= '<div class="panel"><div class="panel-heading"><i class="icon-cogs"></i> ' . $this->h($this->l('Configuration')) . '</div>';
         $output .= '<form method="post">' . $nonce;
         $output .= '<div class="form-group"><label><strong>1.</strong> ' . $this->h($this->l('Adresse de SSM Core')) . '</label>'
             . '<input type="text" name="SSM_SSM_URL" value="' . $this->h($url) . '" class="form-control" placeholder="https://ssm.example.com" autocomplete="off">'
-            . '<p class="help-block">' . $this->h($this->l('Collez l\'adresse fournie par SSM Core. Le HTTPS est obligatoire.')) . '</p></div>';
+            . '<p class="help-block">' . $this->h($this->l('Collez l\'adresse de SSM Core (copiée depuis votre navigateur, seule la partie https://nom-de-domaine compte). Le HTTPS est obligatoire.')) . '</p></div>';
 
+        $placeholder = $token !== ''
+            ? '•••• ' . substr($token, -4) . ' — ' . $this->l('laisser vide pour conserver')
+            : $this->l('collez le token ici');
         $output .= '<div class="form-group"><label><strong>2.</strong> ' . $this->h($this->l('Token de cette boutique')) . '</label>'
-            . '<input type="password" id="ssm-token" name="SSM_CONNECTOR_TOKEN" value="' . $this->h($token) . '" class="form-control" autocomplete="new-password" spellcheck="false">'
-            . '<p class="help-block">' . $this->h($this->l('Collez ici le token généré par SSM Core pour cette boutique. Si SSM Core ne vous en impose pas, copiez plutôt ce token (généré par le module) dans le tableau de bord SSM.')) . '</p>'
-            . '<button type="button" class="btn btn-default" onclick="ssmCopy(\'ssm-token\')">Copier</button> '
-            . '<button type="button" class="btn btn-default" onclick="ssmToggle(\'ssm-token\')">Afficher / masquer</button></div>';
+            . '<input type="password" name="SSM_CONNECTOR_TOKEN" value="" class="form-control" placeholder="' . $this->h($placeholder) . '" autocomplete="new-password" spellcheck="false">'
+            . '<p class="help-block">' . $this->h($this->l('Dans SSM Core : Sites, bouton 🔌 de la boutique, puis copiez le token (il n\'est affiché qu\'une fois). Un nouveau token remplace l\'ancien.')) . '</p></div>';
 
         $output .= '<div class="form-group"><label><strong>3.</strong> ' . $this->h($this->l('Fréquence d\'envoi')) . '</label>'
             . '<select name="SSM_HEARTBEAT_INTERVAL" class="form-control">';
@@ -221,7 +217,7 @@ class Ssmconnector extends Module
         $output .= '<button type="submit" name="submitSSMCheckUpdate" class="btn btn-default">Vérifier les mises à jour</button>';
         $output .= '</form></div>';
 
-        $output .= $this->renderSecurityPanel($nonce, $token);
+        $output .= $this->renderSecurityPanel();
         $output .= $this->renderScripts();
 
         return $output;
@@ -229,7 +225,7 @@ class Ssmconnector extends Module
 
     private function processForms()
     {
-        $actions = ['submitSSMConfig', 'submitSSMHeartbeatNow', 'submitSSMCheckUpdate', 'submitSSMRegenerateToken'];
+        $actions = ['submitSSMConfig', 'submitSSMHeartbeatNow', 'submitSSMCheckUpdate'];
         $submitted = null;
         foreach ($actions as $action) {
             if (Tools::isSubmit($action)) {
@@ -252,11 +248,15 @@ class Ssmconnector extends Module
                     return $this->displayError($error);
                 }
                 // Token saisi (celui de SSM Core) : vide = on conserve l'actuel
-                $token = trim((string) Tools::getValue('SSM_CONNECTOR_TOKEN'));
-                if ($token !== '' && !$this->isValidToken($token)) {
-                    return $this->displayError($this->l('Token invalide : 16 à 512 caractères visibles, sans espace ni retour à la ligne.'));
+                $typed = (string) Tools::getValue('SSM_CONNECTOR_TOKEN');
+                $token = null;
+                if (trim($typed) !== '') {
+                    list($token, $error) = $this->normalizeToken($typed);
+                    if ($token === null) {
+                        return $this->displayError($error);
+                    }
                 }
-                if ($token !== '') {
+                if ($token !== null) {
                     Configuration::updateValue('SSM_CONNECTOR_TOKEN', $token);
                 }
                 Configuration::updateValue('SSM_SSM_URL', $url);
@@ -270,12 +270,6 @@ class Ssmconnector extends Module
             case 'submitSSMCheckUpdate':
                 $this->getUpdateInfo(true);
                 return '';
-
-            case 'submitSSMRegenerateToken':
-                Configuration::updateValue('SSM_CONNECTOR_TOKEN', bin2hex(random_bytes(32)));
-                Configuration::updateValue('SSM_HEARTBEAT_OK', 0);
-                Configuration::updateValue('SSM_LAST_ERROR', '');
-                return $this->displayConfirmation($this->l('Nouveau token généré. Copiez-le dans SSM Core : tant que les deux ne sont pas identiques, la connexion est refusée.'));
         }
 
         return '';
@@ -289,15 +283,22 @@ class Ssmconnector extends Module
             : $this->displayError($result['hint']);
     }
 
-    private function renderStatus($url, $ok, $last, $error, $auto, array $update)
+    private function renderStatus($url, $token, $ok, $last, $error, $auto, array $update)
     {
-        if ($url === '') {
-            $banner = '<div class="alert alert-info"><strong>Bienvenue !</strong> Renseignez l\'adresse de SSM Core ci-dessous : la configuration prend moins d\'une minute.</div>';
+        $configured = $url !== '' && $token !== '';
+        if (!$configured) {
+            $banner = '<div class="alert alert-info"><strong>Pas encore connecté.</strong> '
+                . '1) Dans SSM Core, ouvrez <em>Sites</em>, cliquez sur 🔌 à côté de la boutique et copiez le <strong>token</strong> ; '
+                . '2) collez ci-dessous l\'adresse de SSM Core et ce token ; '
+                . '3) cliquez sur <strong>Enregistrer et tester la connexion</strong>.</div>';
         } elseif ($ok) {
             $banner = '<div class="alert alert-success"><strong>Connecté à SSM Core</strong>' . ($last ? ' — dernier échange le ' . $this->h($last) : '') . '</div>';
         } else {
             $banner = '<div class="alert alert-danger"><strong>Non connecté.</strong> '
                 . $this->h($error !== '' ? $error : $this->l('Aucun échange réussi pour le moment : cliquez sur « Enregistrer et tester la connexion ».')) . '</div>';
+        }
+        if ($token !== '' && strlen($token) < self::TOKEN_MIN) {
+            $banner .= '<div class="alert alert-warning">Ce token est trop court pour SSM Core (' . (int) self::TOKEN_MIN . ' caractères minimum) : collez celui que SSM Core a généré.</div>';
         }
 
         if ($update['available']) {
@@ -309,6 +310,7 @@ class Ssmconnector extends Module
         }
         $checks = [
             [$url !== '', 'Adresse de SSM Core renseignée'],
+            [$token !== '', 'Token renseigné'],
             [$ok, 'Connexion à SSM Core réussie'],
             [$auto, 'Envoi automatique activé'],
             $version_check,
@@ -325,29 +327,25 @@ class Ssmconnector extends Module
             . $banner . $list . $this->renderUpdateNotice($update) . '</div>';
     }
 
-    private function renderSecurityPanel($nonce, $token)
+    private function renderSecurityPanel()
     {
         $cron_url = $this->context->link->getModuleLink($this->name, 'cron');
-        $command = 'curl -fsS -H "X-SSM-Token: ' . $token . '" "' . $cron_url . '"';
-        $masked = 'curl -fsS -H "X-SSM-Token: ' . str_repeat('•', 12) . '" "' . $cron_url . '"';
+        // Le token n'est jamais écrit dans la page : on y met un marqueur à remplacer par le token de l'étape 2.
+        $command = 'curl -fsS -H "X-SSM-Token: VOTRE_TOKEN" "' . $cron_url . '"';
 
         $html = '<div class="panel"><div class="panel-heading"><i class="icon-lock"></i> ' . $this->h($this->l('Sécurité et options avancées')) . '</div>';
-        $html .= '<form method="post" style="margin-bottom:1.5rem;">' . $nonce
-            . '<p>' . $this->h($this->l('Si le token a été exposé, remplacez-le : générez-en un nouveau dans SSM Core puis collez-le à l\'étape 2. Si SSM Core accepte un token personnalisé, vous pouvez aussi en générer un ici et le copier dans SSM Core. Tant que les deux ne sont pas identiques, SSM Core refuse la boutique.')) . '</p>'
-            . '<button type="submit" name="submitSSMRegenerateToken" class="btn btn-warning" onclick="return confirm(\'Générer un nouveau token ? Il devra être identique dans SSM Core, sinon la connexion sera refusée.\');">Générer un nouveau token ici</button></form>';
+        $html .= '<p>' . $this->h($this->l('Si le token a été exposé : dans SSM Core, générez-en un nouveau (Sites, bouton 🔌) puis collez-le à l\'étape 2. L\'ancien cesse de fonctionner aussitôt. Le token n\'est jamais réaffiché ici.')) . '</p>';
         $html .= '<p><strong>' . $this->h($this->l('Tâche cron (facultatif)')) . '</strong> — '
-            . $this->h($this->l('pour un envoi à heure fixe, même sans visite sur la boutique. À planifier toutes les 5 minutes :')) . '</p>'
-            . '<code id="ssm-cron" data-value="' . $this->h($command) . '" data-mask="' . $this->h($masked) . '" data-shown="0" style="background:#f1f5f9;padding:0.5rem;display:block;word-break:break-all;">' . $this->h($masked) . '</code>'
-            . '<p style="margin-top:0.5rem;"><button type="button" class="btn btn-default" onclick="ssmCopy(\'ssm-cron\')">Copier la commande</button> '
-            . '<button type="button" class="btn btn-default" onclick="ssmToggle(\'ssm-cron\')">Afficher / masquer</button></p>';
+            . $this->h($this->l('pour un envoi à heure fixe, même sans visite sur la boutique. À planifier toutes les 5 minutes, en remplaçant VOTRE_TOKEN par le token de l\'étape 2 :')) . '</p>'
+            . '<code id="ssm-cron" data-value="' . $this->h($command) . '" style="background:#f1f5f9;padding:0.5rem;display:block;word-break:break-all;">' . $this->h($command) . '</code>'
+            . '<p style="margin-top:0.5rem;"><button type="button" class="btn btn-default" onclick="ssmCopy(\'ssm-cron\')">Copier la commande</button></p>';
         return $html . '</div>';
     }
 
     private function renderScripts()
     {
         return '<script>'
-            . 'function ssmCopy(id){var e=document.getElementById(id);var v=e.tagName==="INPUT"?e.value:e.dataset.value;if(navigator.clipboard){navigator.clipboard.writeText(v);}else{window.prompt("Copiez la valeur :",v);}}'
-            . 'function ssmToggle(id){var e=document.getElementById(id);if(e.tagName==="INPUT"){e.type=e.type==="password"?"text":"password";return;}var s=e.dataset.shown==="1";e.textContent=s?e.dataset.mask:e.dataset.value;e.dataset.shown=s?"0":"1";}'
+            . 'function ssmCopy(id){var e=document.getElementById(id);var v=e.dataset.value;if(navigator.clipboard){navigator.clipboard.writeText(v);}else{window.prompt("Copiez la valeur :",v);}}'
             . '</script>';
     }
 
@@ -411,10 +409,28 @@ class Ssmconnector extends Module
         return [$scheme . '://' . $host . (isset($parts['port']) ? ':' . (int) $parts['port'] : '') . (isset($parts['path']) ? rtrim($parts['path'], '/') : ''), null];
     }
 
-    /** Caractères ASCII visibles uniquement : le token est envoyé dans un en-tête HTTP. */
-    private function isValidToken($token)
+    /** Caractères ASCII visibles uniquement (le token est envoyé dans un en-tête HTTP), 32 à 256 comme SSM Core l'exige. */
+    public function isValidToken($token)
     {
-        return (bool) preg_match('/^[\x21-\x7E]{16,512}$/', $token);
+        return (bool) preg_match('/^[\x21-\x7E]{' . self::TOKEN_MIN . ',' . self::TOKEN_MAX . '}$/D', (string) $token);
+    }
+
+    /**
+     * Nettoie un token collé (espaces, retours à la ligne, guillemets, préfixes « Bearer » / « X-SSM-Token: »)
+     * puis le contrôle. Retourne [token, null] ou [null, message].
+     */
+    public function normalizeToken($raw)
+    {
+        $token = preg_replace('/^\s*(x-ssm-token\s*:|authorization\s*:\s*bearer|bearer)\s*/i', '', (string) $raw);
+        $token = trim((string) preg_replace('/\s+/', '', $token), "\"'`<>");
+        if ($token === '' || !$this->isValidToken($token)) {
+            return [null, sprintf(
+                $this->l('Token invalide : %d à %d caractères visibles, sans espace. Recopiez-le en entier depuis SSM Core (Sites, bouton 🔌).'),
+                self::TOKEN_MIN,
+                self::TOKEN_MAX
+            )];
+        }
+        return [$token, null];
     }
 
     // === Protection des formulaires (CSRF) ===
@@ -434,8 +450,8 @@ class Ssmconnector extends Module
 
     private function isHeartbeatDue()
     {
-        if (trim((string) Configuration::get('SSM_SSM_URL')) === '') {
-            return false;
+        if (trim((string) Configuration::get('SSM_SSM_URL')) === '' || trim((string) Configuration::get('SSM_CONNECTOR_TOKEN')) === '') {
+            return false;   // pas encore connecté : rien à envoyer, et ce n'est pas une panne
         }
         $interval = $this->clampInterval((int) Configuration::get('SSM_HEARTBEAT_INTERVAL'));
         // Après un échec, nouvel essai plus rapide (au plus toutes les 5 minutes)
@@ -466,7 +482,7 @@ class Ssmconnector extends Module
         Configuration::updateValue('SSM_HEARTBEAT_LOCK', $now);
 
         $this->runAfterResponse(function () {
-            $this->sendHeartbeat();
+            $this->sendHeartbeat(self::AUTO_TIMEOUT);
         });
     }
 
@@ -499,9 +515,9 @@ class Ssmconnector extends Module
         return $result['ok'] ? ['status' => 'sent'] : ['status' => 'failed', 'error' => $result['hint']];
     }
 
-    private function sendHeartbeat()
+    private function sendHeartbeat($timeout = 15)
     {
-        $result = $this->postToSSM('/api/v1/heartbeat', $this->collectInventory());
+        $result = $this->postToSSM('/api/v1/heartbeat', $this->collectInventory(), $timeout);
         Configuration::updateValue('SSM_HEARTBEAT_OK', $result['ok'] ? 1 : 0);
         Configuration::updateValue('SSM_LAST_HEARTBEAT_AT', date('Y-m-d H:i:s'));
         Configuration::updateValue('SSM_LAST_ERROR', $result['ok'] ? '' : $result['hint']);
@@ -548,22 +564,42 @@ class Ssmconnector extends Module
         return 'forbidden';
     }
 
+    /** Tronque à la longueur maximale acceptée par SSM Core : au-delà il refuse tout l'inventaire (422). */
+    private function cut($value, $max)
+    {
+        $value = (string) $value;
+        return function_exists('mb_substr') ? mb_substr($value, 0, $max) : substr($value, 0, $max);
+    }
+
+    private function cutOrNull($value, $max)
+    {
+        $value = $this->cut($value, $max);
+        return $value === '' ? null : $value;
+    }
+
+    /**
+     * Inventaire envoyé à SSM Core. Les clés lues par SSM Core sont en tête (cms_version, php_version, db_version, web_server,
+     * hostname, site_path, extensions, themes) ; le reste est informatif. Les longueurs sont celles de SSM Core (app/schemas.py).
+     */
     private function collectInventory()
     {
         $db = Db::getInstance();
-        $modules = [];
+        $extensions = [];
         $all_modules = $db->executeS('SELECT name, version, active FROM ' . _DB_PREFIX_ . 'module') ?: [];
         foreach ($all_modules as $m) {
-            $modules[] = [
-                'type' => 'module',
-                'slug' => $m['name'],
-                'name' => $m['name'],
-                'version' => $m['version'],
+            $extensions[] = [
+                'slug' => $this->cut($m['name'], 255),
+                'name' => $this->cut($m['name'], 255),
+                'version' => $this->cutOrNull($m['version'], 50),
                 'is_active' => (bool) $m['active'],
             ];
         }
+        $active_count = count(array_filter($extensions, function ($m) {
+            return $m['is_active'];
+        }));
+        $extensions = array_slice($extensions, 0, 1000);
 
-        $themes = $this->collectThemes();
+        $themes = array_slice($this->collectThemes(), 0, 200);
         $update = $this->getUpdateInfo();
 
         $stats = [
@@ -574,22 +610,25 @@ class Ssmconnector extends Module
         ];
 
         return [
+            // lus par SSM Core
+            'cms_version' => $this->cut(_PS_VERSION_, 50),
+            'php_version' => PHP_MAJOR_VERSION . '.' . PHP_MINOR_VERSION . '.' . PHP_RELEASE_VERSION,
+            'db_version' => $this->cutOrNull($db->getVersion(), 50),
+            'web_server' => isset($_SERVER['SERVER_SOFTWARE']) ? $this->cutOrNull($_SERVER['SERVER_SOFTWARE'], 50) : null,
+            'hostname' => function_exists('gethostname') ? $this->cutOrNull(gethostname(), 255) : null,
+            'site_path' => defined('_PS_ROOT_DIR_') ? $this->cutOrNull(_PS_ROOT_DIR_, 500) : null,
+            'extensions' => $extensions,
+            'themes' => $themes,
+            // informatifs (ignorés par SSM Core pour l'instant)
             'cms' => 'prestashop',
-            'cms_version' => _PS_VERSION_,
-            'php_version' => phpversion(),
-            'mysql_version' => $db->getVersion(),
             'multistore' => (bool) Shop::isFeatureActive(),
             'shop_url' => Tools::getShopDomain(true),
             'ssl_enabled' => (bool) Configuration::get('PS_SSL_ENABLED'),
             'debug_mode' => (bool) _PS_MODE_DEV_,
             'maintenance_mode' => !(bool) Configuration::get('PS_SHOP_ENABLE'),
-            'module_count' => count($modules),
-            'module_active_count' => count(array_filter($modules, function ($m) {
-                return $m['is_active'];
-            })),
+            'module_count' => count($extensions),
+            'module_active_count' => $active_count,
             'theme_count' => count($themes),
-            'modules' => $modules,
-            'themes' => $themes,
             'stats' => $stats,
             'connector_version' => $this->version,
             'latest_connector_version' => $update['latest'],
@@ -610,16 +649,15 @@ class Ssmconnector extends Module
                     $slug = !empty($theme->directory) ? $theme->directory : $theme->name;
                     $version = method_exists($theme, 'getVersion') ? $theme->getVersion() : null;
                     $themes[] = [
-                        'type' => 'theme',
-                        'slug' => $slug,
-                        'name' => $theme->name,
-                        'version' => $version ?: '1.0',
+                        'slug' => $this->cut($slug, 255),
+                        'name' => $this->cut($theme->name, 255),
+                        'version' => $this->cut($version ?: '1.0', 50),
                         'is_active' => $slug === $active,
                     ];
                 }
             }
             if (!$themes && $active) {
-                $themes[] = ['type' => 'theme', 'slug' => $active, 'name' => $active, 'version' => '1.0', 'is_active' => true];
+                $themes[] = ['slug' => $this->cut($active, 255), 'name' => $this->cut($active, 255), 'version' => '1.0', 'is_active' => true];
             }
         } catch (Throwable $e) {
             error_log('[SSM Connector] Theme inventory failed: ' . $e->getMessage());
@@ -702,7 +740,7 @@ class Ssmconnector extends Module
         if (!empty($release['draft']) || !empty($release['prerelease'])) {
             return null;
         }
-        if (!preg_match('/^v?(\d+\.\d+\.\d+)$/', isset($release['tag_name']) ? (string) $release['tag_name'] : '', $m)) {
+        if (!preg_match('/^v?(\d+\.\d+\.\d+)$/D', isset($release['tag_name']) ? (string) $release['tag_name'] : '', $m)) {
             return null;
         }
 
@@ -761,9 +799,20 @@ class Ssmconnector extends Module
         Configuration::updateValue('SSM_PENDING_EVENTS', json_encode(array_values(array_slice($events, -self::MAX_PENDING_EVENTS))));
     }
 
-    private function queueEvent($type, $payload)
+    /**
+     * Met un événement en file. Un événement identique au précédent, à moins d'une minute, n'est pas répété
+     * (ou, avec $throttle, tout événement du même type) : une attaque par force brute ou un import de produits
+     * n'écrit pas en base à chaque requête.
+     */
+    private function queueEvent($type, $payload, $throttle = false)
     {
         $events = $this->getPendingEvents();
+        $last = end($events);
+        if (is_array($last) && isset($last['type'], $last['timestamp']) && $last['type'] === $type
+            && (time() - (int) strtotime((string) $last['timestamp'])) < self::EVENT_THROTTLE
+            && ($throttle || (isset($last['payload']) && $last['payload'] == $payload))) {
+            return;
+        }
         $events[] = ['type' => $type, 'payload' => $payload, 'timestamp' => date('c')];
         $this->setPendingEvents($events);
     }
@@ -771,7 +820,7 @@ class Ssmconnector extends Module
     // === Transport ===
 
     /** Retourne ['ok' => bool, 'http_code' => int, 'hint' => message lisible]. */
-    private function postToSSM($path, $body)
+    private function postToSSM($path, $body, $timeout = 15)
     {
         list($base, $error) = $this->normalizeUrl(Configuration::get('SSM_SSM_URL'));
         if ($base === null) {
@@ -779,6 +828,9 @@ class Ssmconnector extends Module
         }
 
         $token = (string) Configuration::get('SSM_CONNECTOR_TOKEN');
+        if ($token === '') {
+            return ['ok' => false, 'http_code' => 0, 'hint' => $this->l('Token manquant : collez le token de cette boutique (dans SSM Core : Sites, bouton 🔌).')];
+        }
         $events = $this->getPendingEvents();
         $body['pending_events'] = $events;
 
@@ -787,7 +839,6 @@ class Ssmconnector extends Module
             error_log('[SSM Connector] JSON encoding failed: ' . json_last_error_msg());
             return ['ok' => false, 'http_code' => 0, 'hint' => $this->l('Envoi impossible : données illisibles (encodage).')];
         }
-        $signature = hash_hmac('sha256', $payload, $token);
 
         $ch = curl_init($base . $path);
         curl_setopt_array($ch, [
@@ -795,15 +846,15 @@ class Ssmconnector extends Module
             CURLOPT_POSTFIELDS => $payload,
             CURLOPT_RETURNTRANSFER => true,
             CURLOPT_FOLLOWLOCATION => false, // ne jamais renvoyer le token vers une autre adresse
+            CURLOPT_PROTOCOLS => CURLPROTO_HTTP | CURLPROTO_HTTPS,
             CURLOPT_SSL_VERIFYPEER => true,
             CURLOPT_SSL_VERIFYHOST => 2,
             CURLOPT_HTTPHEADER => [
                 'Content-Type: application/json',
                 'X-SSM-Token: ' . $token,
-                'X-SSM-Signature: ' . $signature,
             ],
-            CURLOPT_TIMEOUT => 15,
-            CURLOPT_CONNECTTIMEOUT => 5,
+            CURLOPT_TIMEOUT => max(1, (int) $timeout),
+            CURLOPT_CONNECTTIMEOUT => min(5, max(1, (int) $timeout)),
         ]);
         $response = curl_exec($ch);
         $http_code = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
@@ -812,7 +863,7 @@ class Ssmconnector extends Module
 
         if ($response === false || $http_code < 200 || $http_code >= 300) {
             error_log("[SSM Connector] POST $path failed: HTTP $http_code (curl $errno)");
-            return ['ok' => false, 'http_code' => $http_code, 'hint' => $this->describeFailure($http_code, $errno)];
+            return ['ok' => false, 'http_code' => $http_code, 'hint' => $this->describeFailure($http_code, $errno, is_string($response) ? $response : '')];
         }
 
         // Succès : on retire uniquement les événements envoyés (d'autres ont pu être ajoutés entre-temps)
@@ -820,8 +871,8 @@ class Ssmconnector extends Module
         return ['ok' => true, 'http_code' => $http_code, 'hint' => ''];
     }
 
-    /** Explique un échec d'envoi en langage clair, avec l'action à mener. */
-    private function describeFailure($http_code, $errno)
+    /** Explique un échec d'envoi en langage clair, avec l'action à mener. Ne cite jamais le token. */
+    public function describeFailure($http_code, $errno, $body = '')
     {
         if ($errno === 6) {
             return $this->l('Adresse introuvable : vérifiez l\'adresse de SSM Core (faute de frappe ?).');
@@ -832,11 +883,24 @@ class Ssmconnector extends Module
         if (in_array($errno, [35, 51, 58, 60, 77], true)) {
             return $this->l('Certificat HTTPS invalide ou non reconnu par ce serveur : la connexion est refusée par sécurité.');
         }
-        if ($http_code === 401 || $http_code === 403) {
-            return $this->l('Token refusé par SSM Core : vérifiez que le token ci-dessous est exactement celui fourni par SSM Core pour cette boutique (copier-coller, sans espace).');
+        if ($http_code === 401) {
+            return $this->l('Token refusé par SSM Core : collez le token généré par SSM Core pour cette boutique (Sites, bouton 🔌). Un nouveau token invalide l\'ancien.');
+        }
+        if ($http_code === 403) {
+            return $this->l('Accès refusé (403) : un pare-feu ou un filtre devant SSM Core bloque peut-être cette boutique.');
         }
         if ($http_code === 404) {
             return $this->l('L\'API SSM est introuvable à cette adresse : vérifiez l\'adresse de SSM Core.');
+        }
+        if ($http_code === 422) {
+            $detail = '';
+            $json = json_decode((string) $body, true);
+            if (is_array($json) && isset($json['detail'][0]) && is_array($json['detail'][0])) {
+                $first = $json['detail'][0];
+                $loc = isset($first['loc']) && is_array($first['loc']) ? implode('.', array_map('strval', $first['loc'])) : '';
+                $detail = trim($loc . ' ' . (isset($first['msg']) ? (string) $first['msg'] : ''));
+            }
+            return $this->l('Données refusées par SSM Core (422)') . ($detail !== '' ? ' : ' . $this->cut($detail, 200) : '') . '.';
         }
         if ($http_code === 429) {
             return $this->l('SSM Core limite temporairement les envois de cette boutique : réessayez dans quelques minutes.');

@@ -1,0 +1,24 @@
+/* Habillage approximatif du back-office PrestaShop pour les aperçus du README (le module produit des classes Bootstrap). */
+* { box-sizing: border-box; }
+body { margin: 0; padding: 24px; background: #e9edf0; color: #363a41; font: 15px/1.45 "Open Sans", Helvetica, Arial, sans-serif; }
+.crumb { color: #6c868e; font-size: 13px; margin-bottom: 2px; }
+h1 { margin: 0 0 18px; font-size: 24px; color: #363a41; }
+.panel { background: #fff; border-radius: 4px; box-shadow: 0 1px 3px rgba(0, 0, 0, .12); padding: 22px 24px; margin-bottom: 20px; }
+.panel-heading { text-transform: uppercase; letter-spacing: .02em; font-weight: 700; font-size: 13px; margin-bottom: 14px; color: #363a41; }
+.panel-heading i { display: none; }
+.alert { padding: 12px 14px; border-radius: 4px; margin-bottom: 14px; border: 1px solid transparent; }
+.alert-info { background: #d9edf7; border-color: #bce8f1; color: #31708f; }
+.alert-success { background: #dff0d8; border-color: #d0e9c6; color: #3c763d; }
+.alert-danger { background: #f2dede; border-color: #ebccd1; color: #a94442; }
+.alert-warning { background: #fcf8e3; border-color: #faebcc; color: #8a6d3b; }
+.form-group { margin-bottom: 16px; }
+label { display: block; font-weight: 700; margin-bottom: 4px; }
+.form-control { display: block; width: 100%; padding: 8px 12px; border: 1px solid #bbcdd2; border-radius: 3px; font: inherit; background: #fff; color: #363a41; }
+.form-control::placeholder { color: #8a9aa0; }
+.help-block { color: #6c868e; margin: 4px 0 0; font-size: 14px; }
+.checkbox label { font-weight: 400; display: flex; gap: 8px; align-items: center; }
+.btn { display: inline-block; padding: 8px 16px; border: 1px solid #bbcdd2; border-radius: 3px; background: #fff; color: #363a41; font: inherit; cursor: pointer; margin: 2px 4px 2px 0; }
+.btn-primary { background: #25b9d7; border-color: #25b9d7; color: #fff; }
+code { display: block; background: #f1f5f9; color: #c7254e; padding: 8px 10px; border-radius: 3px; font: 13px/1.4 Menlo, Consolas, monospace; word-break: break-all; }
+ul.list-unstyled { list-style: none; padding: 0; }
+em { font-style: italic; }
