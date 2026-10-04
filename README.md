@@ -1,3 +1,5 @@
+<p align="center"><img src="logo.png" alt="SSM Connector" width="96" height="96"></p>
+
 # SSM Connector — PrestaShop
 
 Module natif PrestaShop (8.x, 9.x visé) qui relie la boutique à **SSM Core** (Selest Site Manager) : inventaire (modules, thèmes, versions), statistiques de base, journal d'événements et suivi de l'état de la boutique.

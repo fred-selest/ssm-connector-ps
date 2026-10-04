@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128" role="img" aria-label="SSM Connector">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#1e40af"/>
+      <stop offset="1" stop-color="#0f172a"/>
+    </linearGradient>
+  </defs>
+  <rect width="128" height="128" rx="28" fill="url(#bg)"/>
+  <polyline points="16,68 38,68 49,42 63,92 76,54 85,68 100,68" fill="none" stroke="#ffffff" stroke-width="7" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="106" cy="68" r="16" fill="none" stroke="#22c55e" stroke-opacity="0.35" stroke-width="4"/>
+  <circle cx="106" cy="68" r="9" fill="#22c55e"/>
+</svg>
