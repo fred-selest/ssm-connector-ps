@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  php:
+    name: PHP ${{ matrix.php }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        php: ['8.1', '8.3']
+    steps:
+      - uses: actions/checkout@v4
+      - name: Syntaxe et tests sur PHP ${{ matrix.php }}
+        run: |
+          docker run --rm -v "$PWD":/app -w /app php:${{ matrix.php }}-cli sh -c '
+            set -e
+            find . -name "*.php" -not -path "./.git/*" -print0 | xargs -0 -n1 php -l >/dev/null
+            php tests/run.php 2>/dev/null'
+
+  package:
+    name: Archive du module
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Construire l'archive
+        run: git archive --prefix=ssmconnector/ -o ssmconnector.zip HEAD
+      - name: Contenu de l'archive
+        run: |
+          unzip -l ssmconnector.zip
+          # un seul dossier à la racine : celui que PrestaShop crée dans modules/
+          test "$(unzip -Z1 ssmconnector.zip | cut -d/ -f1 | sort -u)" = "ssmconnector"
+          unzip -Z1 ssmconnector.zip | grep -qx 'ssmconnector/ssmconnector.php'
+          unzip -Z1 ssmconnector.zip | grep -qx 'ssmconnector/config.xml'
+          # ni les tests ni les aperçus ne doivent partir dans le module
+          ! unzip -Z1 ssmconnector.zip | grep -E '^ssmconnector/(tests|docs|\.github)/'
