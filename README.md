@@ -17,11 +17,10 @@ Un badge **SSM: OK / KO** est affiché dans l'en-tête du back-office.
 
 ## Installation
 
-1. Créer l'archive (le dossier du module doit s'appeler `ssmconnector`) :
+1. Télécharger `ssmconnector.zip` depuis la [dernière release](../../releases/latest), ou le construire (le dossier racine doit s'appeler `ssmconnector`) :
    ```bash
    git archive --prefix=ssmconnector/ -o ssmconnector.zip HEAD
    ```
-   ou télécharger `ssmconnector.zip` depuis les releases.
 2. Back-office PrestaShop → Modules → Gestionnaire de modules → Téléverser un module.
 3. Ouvrir la configuration du module : renseigner l'**URL de SSM Core** et noter le **token** (généré à l'installation).
 4. Déclarer la boutique dans SSM Core avec ce token.
@@ -49,9 +48,19 @@ Le heartbeat n'est envoyé que si l'intervalle configuré est écoulé ; ajouter
 - PHP 8.1 minimum, extension cURL
 - Multiboutique : la configuration suit le contexte de boutique
 
-## Mise à jour depuis une version précédente
+## Mise à jour du connecteur
 
-Remplacer le dossier `modules/ssmconnector/` puis, dans le gestionnaire de modules, lancer la mise à jour : le script `upgrade/upgrade-0.3.0.php` ajoute les réglages manquants, enregistre les hooks et répare la file d'événements.
+**Détection.** Le module compare sa version à la dernière release GitHub de ce dépôt (au plus une vérification toutes les 12 h, ou à la demande via « Vérifier les mises à jour »). Quand une version plus récente existe, la page de configuration affiche un bandeau avec le lien de téléchargement et les notes de version, et le heartbeat transmet `latest_connector_version` et `connector_update_available` à SSM Core. La vérification est une simple requête publique vers `api.github.com` : aucune donnée de la boutique n'est envoyée. Une indisponibilité de GitHub n'a aucun effet sur le fonctionnement du module.
+
+**Installation de la mise à jour.** Elle reste manuelle : remplacer le dossier `modules/ssmconnector/` par le contenu de `ssmconnector.zip`, puis lancer la mise à jour du module dans le gestionnaire de modules. Les scripts du dossier `upgrade/` s'exécutent alors (le script `upgrade-0.3.0.php` ajoute les réglages manquants, enregistre les hooks et répare la file d'événements). Le token et la configuration sont conservés.
+
+**Publier une version** (mainteneurs) : mettre à jour la version dans `ssmconnector.php` et `config.xml`, ajouter si besoin `upgrade/upgrade-X.Y.Z.php`, puis :
+
+```bash
+git tag vX.Y.Z && git push origin vX.Y.Z
+```
+
+Le workflow `.github/workflows/release.yml` vérifie la syntaxe PHP, contrôle que le tag correspond à la version du module, construit `ssmconnector.zip` (dossier racine `ssmconnector/`) et crée la release GitHub.
 
 ## Développement
 

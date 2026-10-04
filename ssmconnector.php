@@ -15,6 +15,8 @@ class Ssmconnector extends Module
     const MAX_PENDING_EVENTS = 100;
     const MIN_INTERVAL = 300;
     const MAX_INTERVAL = 86400;
+    const UPDATE_REPO = 'fred-selest/ssm-connector-ps';
+    const UPDATE_TTL = 43200;
 
     public function __construct()
     {
@@ -44,7 +46,8 @@ class Ssmconnector extends Module
             && Configuration::deleteByName('SSM_LAST_HEARTBEAT_AT')
             && Configuration::deleteByName('SSM_HEARTBEAT_OK')
             && Configuration::deleteByName('SSM_CONNECTOR_TOKEN')
-            && Configuration::deleteByName('SSM_PENDING_EVENTS');
+            && Configuration::deleteByName('SSM_PENDING_EVENTS')
+            && Configuration::deleteByName('SSM_UPDATE_CACHE');
     }
 
     /**
@@ -179,6 +182,8 @@ class Ssmconnector extends Module
             }
         }
 
+        $update = $this->getUpdateInfo(Tools::isSubmit('submitSSMCheckUpdate'));
+
         $url = (string) Configuration::get('SSM_SSM_URL');
         $interval = (int) Configuration::get('SSM_HEARTBEAT_INTERVAL');
         $token = (string) Configuration::get('SSM_CONNECTOR_TOKEN');
@@ -187,13 +192,15 @@ class Ssmconnector extends Module
         $cron_url = $this->context->link->getModuleLink($this->name, 'cron');
 
         $output .= '<div class="panel"><div class="panel-heading"><i class="icon-cogs"></i> ' . $this->h($this->l('SSM Connector')) . '</div>';
+        $output .= $this->renderUpdateNotice($update);
         $output .= '<form method="post">';
         $output .= '<div class="form-group"><label>URL SSM Core</label><input type="url" name="SSM_SSM_URL" value="' . $this->h($url) . '" class="input" placeholder="https://ssm.example.com" required></div>';
         $output .= '<div class="form-group"><label>Intervalle heartbeat (s)</label><input type="number" name="SSM_HEARTBEAT_INTERVAL" value="' . $interval . '" min="' . self::MIN_INTERVAL . '" max="' . self::MAX_INTERVAL . '"></div>';
         $output .= '<div class="form-group"><label>Token</label><code style="background:#f1f5f9;padding:0.5rem;display:block;word-break:break-all;">' . $this->h($token ?: 'non généré') . '</code></div>';
         $output .= '<div class="form-group"><label>URL cron (appel périodique)</label><code style="background:#f1f5f9;padding:0.5rem;display:block;word-break:break-all;">curl -fsS -H "X-SSM-Token: &lt;token&gt;" ' . $this->h($cron_url) . '</code></div>';
         $output .= '<button type="submit" name="submitSSMConfig" class="btn btn-default">Enregistrer</button> ';
-        $output .= '<button type="submit" name="submitSSMHeartbeatNow" class="btn btn-primary">Heartbeat maintenant</button>';
+        $output .= '<button type="submit" name="submitSSMHeartbeatNow" class="btn btn-primary">Heartbeat maintenant</button> ';
+        $output .= '<button type="submit" name="submitSSMCheckUpdate" class="btn btn-default" formnovalidate>Vérifier les mises à jour</button>';
         $output .= '</form>';
 
         $output .= '<div class="alert alert-' . ($ok ? 'success' : 'warning') . '"><strong>Statut :</strong> ' . ($ok ? 'Heartbeat OK' : 'Pas de ping');
@@ -247,6 +254,7 @@ class Ssmconnector extends Module
         }
 
         $themes = $this->collectThemes();
+        $update = $this->getUpdateInfo();
 
         $stats = [
             'customers' => (int) $db->getValue('SELECT COUNT(*) FROM ' . _DB_PREFIX_ . 'customer'),
@@ -274,8 +282,129 @@ class Ssmconnector extends Module
             'themes' => $themes,
             'stats' => $stats,
             'connector_version' => $this->version,
+            'latest_connector_version' => $update['latest'],
+            'connector_update_available' => $update['available'],
             'timestamp' => date('c'),
         ];
+    }
+
+    // === Mise à jour du connecteur ===
+
+    /**
+     * Compare la version installée à la dernière release GitHub publiée.
+     * Résultat mis en cache (SSM_UPDATE_CACHE, UPDATE_TTL) ; $force ignore le cache.
+     * Une erreur réseau ne casse jamais l'appelant : on garde la dernière info connue.
+     */
+    public function getUpdateInfo($force = false)
+    {
+        $cache = json_decode((string) Configuration::get('SSM_UPDATE_CACHE'), true);
+        if (!is_array($cache)) {
+            $cache = [];
+        }
+
+        $checked_at = isset($cache['checked_at']) ? (int) $cache['checked_at'] : 0;
+        if ($force || (time() - $checked_at) >= self::UPDATE_TTL) {
+            $release = null;
+            try {
+                $json = $this->fetchLatestRelease();
+                $release = is_array($json) ? $this->parseRelease($json) : null;
+            } catch (Throwable $e) {
+                error_log('[SSM Connector] Update check failed: ' . $e->getMessage());
+            }
+
+            $cache = [
+                'checked_at' => time(),
+                'error' => $release === null,
+                'latest' => $release ? $release['latest'] : (isset($cache['latest']) ? $cache['latest'] : null),
+                'url' => $release ? $release['url'] : (isset($cache['url']) ? $cache['url'] : null),
+                'download' => $release ? $release['download'] : (isset($cache['download']) ? $cache['download'] : null),
+            ];
+            Configuration::updateValue('SSM_UPDATE_CACHE', json_encode($cache));
+        }
+
+        $latest = isset($cache['latest']) ? $cache['latest'] : null;
+        return [
+            'current' => $this->version,
+            'latest' => $latest,
+            'available' => $latest !== null && version_compare($latest, $this->version, '>'),
+            'url' => isset($cache['url']) ? $cache['url'] : null,
+            'download' => isset($cache['download']) ? $cache['download'] : null,
+            'checked_at' => isset($cache['checked_at']) ? (int) $cache['checked_at'] : 0,
+            'error' => !empty($cache['error']),
+        ];
+    }
+
+    /** Requête publique, sans authentification : aucune donnée de la boutique n'est transmise. */
+    protected function fetchLatestRelease()
+    {
+        $ch = curl_init('https://api.github.com/repos/' . self::UPDATE_REPO . '/releases/latest');
+        curl_setopt_array($ch, [
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_TIMEOUT => 5,
+            CURLOPT_CONNECTTIMEOUT => 3,
+            CURLOPT_HTTPHEADER => [
+                'Accept: application/vnd.github+json',
+                'User-Agent: ssmconnector/' . $this->version,
+            ],
+        ]);
+        $response = curl_exec($ch);
+        $http_code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        curl_close($ch);
+        if ($response === false || $http_code !== 200) {
+            return null;
+        }
+        return json_decode($response, true);
+    }
+
+    /** Extrait version / liens d'une réponse GitHub ; null si inexploitable. */
+    protected function parseRelease(array $release)
+    {
+        if (!empty($release['draft']) || !empty($release['prerelease'])) {
+            return null;
+        }
+        if (!preg_match('/^v?(\d+\.\d+\.\d+)$/', isset($release['tag_name']) ? (string) $release['tag_name'] : '', $m)) {
+            return null;
+        }
+
+        $prefix = 'https://github.com/' . self::UPDATE_REPO . '/';
+        $page = isset($release['html_url']) ? (string) $release['html_url'] : '';
+        $download = null;
+        if (!empty($release['assets']) && is_array($release['assets'])) {
+            foreach ($release['assets'] as $asset) {
+                if (isset($asset['name'], $asset['browser_download_url']) && $asset['name'] === 'ssmconnector.zip') {
+                    $download = (string) $asset['browser_download_url'];
+                }
+            }
+        }
+
+        // Les liens affichés dans le back-office doivent pointer vers le dépôt du connecteur
+        return [
+            'latest' => $m[1],
+            'url' => strpos($page, $prefix) === 0 ? $page : null,
+            'download' => $download !== null && strpos($download, $prefix) === 0 ? $download : null,
+        ];
+    }
+
+    private function renderUpdateNotice(array $update)
+    {
+        if ($update['available']) {
+            $html = '<div class="alert alert-info"><strong>Mise à jour disponible :</strong> v' . $this->h($update['latest'])
+                . ' (installée : v' . $this->h($update['current']) . ')';
+            if ($update['download']) {
+                $html .= ' — <a href="' . $this->h($update['download']) . '" rel="noopener">télécharger</a>';
+            }
+            if ($update['url']) {
+                $html .= ' — <a href="' . $this->h($update['url']) . '" target="_blank" rel="noopener">notes de version</a>';
+            }
+            return $html . '<br>Remplacez le dossier <code>modules/ssmconnector/</code> par le contenu de l\'archive, puis lancez la mise à jour du module depuis le gestionnaire de modules.</div>';
+        }
+
+        if ($update['error'] && $update['latest'] === null) {
+            return '<div class="alert alert-warning">Vérification des mises à jour impossible pour le moment (v' . $this->h($update['current']) . ' installée).</div>';
+        }
+
+        return '<p class="help-block">Connecteur à jour (v' . $this->h($update['current']) . ')'
+            . ($update['checked_at'] ? ' — vérifié le ' . $this->h(date('Y-m-d H:i', $update['checked_at'])) : '') . '.</p>';
     }
 
     private function collectThemes()
