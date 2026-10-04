@@ -88,6 +88,7 @@ Limites à connaître :
 
 **Publier une version** (mainteneurs) : mettre à jour la version dans `ssmconnector.php` (en-tête et `$this->version`), `config.xml` et `ssmconnector.txt`, ajouter `upgrade/upgrade-X.Y.Z.php` et la section de `CHANGELOG.md`, fusionner dans `main`, puis au choix :
 
+- depuis GitHub : *Actions → Release → Run workflow* avec le numéro de version (sur `main`) : le workflow crée lui-même le tag et la release ;
 - en ligne de commande : `git tag vX.Y.Z && git push origin vX.Y.Z` ;
 - depuis l'interface GitHub : *Releases → Draft a new release*, créer le tag `vX.Y.Z` sur `main`, puis *Publish release*.
 
