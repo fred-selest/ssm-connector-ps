@@ -1,12 +1,24 @@
 name: Release
 
+# Deux façons de publier une version :
+#   - pousser un tag vX.Y.Z (ligne de commande) : la release est créée par le workflow ;
+#   - publier une release depuis l'interface GitHub (qui crée aussi le tag) : le workflow
+#     joint l'archive à la release existante.
+# Un même tag peut déclencher les deux événements : les exécutions sont donc
+# sérialisées par tag et l'envoi de l'archive est idempotent.
 on:
   push:
     tags:
       - 'v*'
+  release:
+    types: [published]
 
 permissions:
   contents: write
+
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: false
 
 jobs:
   release:
@@ -28,7 +40,13 @@ jobs:
       - name: Construire l'archive du module
         run: git archive --prefix=ssmconnector/ -o ssmconnector.zip HEAD
 
-      - name: Publier la release
+      - name: Publier l'archive sur la release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" ssmconnector.zip --title "$GITHUB_REF_NAME" --generate-notes
+          GH_REPO: ${{ github.repository }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" ssmconnector.zip --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" ssmconnector.zip --title "$GITHUB_REF_NAME" --generate-notes
+          fi
