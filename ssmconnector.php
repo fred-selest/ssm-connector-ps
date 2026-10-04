@@ -4,7 +4,7 @@
  *
  * @author  Selest Informatique
  * @license MIT
- * @version 0.4.0
+ * @version 0.4.1
  */
 
 if (!defined('_PS_VERSION_')) {
@@ -27,7 +27,7 @@ class Ssmconnector extends Module
     {
         $this->name = 'ssmconnector';
         $this->tab = 'administration';
-        $this->version = '0.4.0';
+        $this->version = '0.4.1';
         $this->author = 'Selest Informatique';
         $this->need_instance = 0;
         $this->ps_versions_compliancy = ['min' => '8.0.0', 'max' => _PS_VERSION_];
@@ -200,8 +200,8 @@ class Ssmconnector extends Module
             . '<p class="help-block">' . $this->h($this->l('Collez l\'adresse fournie par SSM Core. Le HTTPS est obligatoire.')) . '</p></div>';
 
         $output .= '<div class="form-group"><label><strong>2.</strong> ' . $this->h($this->l('Token de cette boutique')) . '</label>'
-            . '<code id="ssm-token" data-value="' . $this->h($token) . '" data-mask="' . $this->h(str_repeat('•', 24)) . '" data-shown="0" style="background:#f1f5f9;padding:0.5rem;display:block;word-break:break-all;">' . $this->h(str_repeat('•', 24)) . '</code>'
-            . '<p class="help-block">' . $this->h($this->l('Copiez ce token et ajoutez la boutique dans le tableau de bord SSM avec ce token.')) . '</p>'
+            . '<input type="password" id="ssm-token" name="SSM_CONNECTOR_TOKEN" value="' . $this->h($token) . '" class="form-control" autocomplete="new-password" spellcheck="false">'
+            . '<p class="help-block">' . $this->h($this->l('Collez ici le token généré par SSM Core pour cette boutique. Si SSM Core ne vous en impose pas, copiez plutôt ce token (généré par le module) dans le tableau de bord SSM.')) . '</p>'
             . '<button type="button" class="btn btn-default" onclick="ssmCopy(\'ssm-token\')">Copier</button> '
             . '<button type="button" class="btn btn-default" onclick="ssmToggle(\'ssm-token\')">Afficher / masquer</button></div>';
 
@@ -251,6 +251,14 @@ class Ssmconnector extends Module
                 if ($url === null) {
                     return $this->displayError($error);
                 }
+                // Token saisi (celui de SSM Core) : vide = on conserve l'actuel
+                $token = trim((string) Tools::getValue('SSM_CONNECTOR_TOKEN'));
+                if ($token !== '' && !$this->isValidToken($token)) {
+                    return $this->displayError($this->l('Token invalide : 16 à 512 caractères visibles, sans espace ni retour à la ligne.'));
+                }
+                if ($token !== '') {
+                    Configuration::updateValue('SSM_CONNECTOR_TOKEN', $token);
+                }
                 Configuration::updateValue('SSM_SSM_URL', $url);
                 Configuration::updateValue('SSM_HEARTBEAT_INTERVAL', $this->clampInterval((int) Tools::getValue('SSM_HEARTBEAT_INTERVAL')));
                 Configuration::updateValue('SSM_AUTO_HEARTBEAT', Tools::getValue('SSM_AUTO_HEARTBEAT') ? 1 : 0);
@@ -267,7 +275,7 @@ class Ssmconnector extends Module
                 Configuration::updateValue('SSM_CONNECTOR_TOKEN', bin2hex(random_bytes(32)));
                 Configuration::updateValue('SSM_HEARTBEAT_OK', 0);
                 Configuration::updateValue('SSM_LAST_ERROR', '');
-                return $this->displayConfirmation($this->l('Nouveau token généré. Mettez-le à jour dans le tableau de bord SSM : l\'ancien est désormais refusé.'));
+                return $this->displayConfirmation($this->l('Nouveau token généré. Copiez-le dans SSM Core : tant que les deux ne sont pas identiques, la connexion est refusée.'));
         }
 
         return '';
@@ -325,8 +333,8 @@ class Ssmconnector extends Module
 
         $html = '<div class="panel"><div class="panel-heading"><i class="icon-lock"></i> ' . $this->h($this->l('Sécurité et options avancées')) . '</div>';
         $html .= '<form method="post" style="margin-bottom:1.5rem;">' . $nonce
-            . '<p>' . $this->h($this->l('Si le token a été exposé, générez-en un nouveau. L\'ancien sera refusé par SSM Core tant que vous n\'aurez pas mis à jour le tableau de bord SSM.')) . '</p>'
-            . '<button type="submit" name="submitSSMRegenerateToken" class="btn btn-warning" onclick="return confirm(\'Générer un nouveau token ? Il faudra le mettre à jour dans SSM Core.\');">Régénérer le token</button></form>';
+            . '<p>' . $this->h($this->l('Si le token a été exposé, remplacez-le : générez-en un nouveau dans SSM Core puis collez-le à l\'étape 2. Si SSM Core accepte un token personnalisé, vous pouvez aussi en générer un ici et le copier dans SSM Core. Tant que les deux ne sont pas identiques, SSM Core refuse la boutique.')) . '</p>'
+            . '<button type="submit" name="submitSSMRegenerateToken" class="btn btn-warning" onclick="return confirm(\'Générer un nouveau token ? Il devra être identique dans SSM Core, sinon la connexion sera refusée.\');">Générer un nouveau token ici</button></form>';
         $html .= '<p><strong>' . $this->h($this->l('Tâche cron (facultatif)')) . '</strong> — '
             . $this->h($this->l('pour un envoi à heure fixe, même sans visite sur la boutique. À planifier toutes les 5 minutes :')) . '</p>'
             . '<code id="ssm-cron" data-value="' . $this->h($command) . '" data-mask="' . $this->h($masked) . '" data-shown="0" style="background:#f1f5f9;padding:0.5rem;display:block;word-break:break-all;">' . $this->h($masked) . '</code>'
@@ -338,8 +346,8 @@ class Ssmconnector extends Module
     private function renderScripts()
     {
         return '<script>'
-            . 'function ssmCopy(id){var e=document.getElementById(id);if(navigator.clipboard){navigator.clipboard.writeText(e.dataset.value);}else{window.prompt("Copiez la valeur :",e.dataset.value);}}'
-            . 'function ssmToggle(id){var e=document.getElementById(id);var s=e.dataset.shown==="1";e.textContent=s?e.dataset.mask:e.dataset.value;e.dataset.shown=s?"0":"1";}'
+            . 'function ssmCopy(id){var e=document.getElementById(id);var v=e.tagName==="INPUT"?e.value:e.dataset.value;if(navigator.clipboard){navigator.clipboard.writeText(v);}else{window.prompt("Copiez la valeur :",v);}}'
+            . 'function ssmToggle(id){var e=document.getElementById(id);if(e.tagName==="INPUT"){e.type=e.type==="password"?"text":"password";return;}var s=e.dataset.shown==="1";e.textContent=s?e.dataset.mask:e.dataset.value;e.dataset.shown=s?"0":"1";}'
             . '</script>';
     }
 
@@ -401,6 +409,12 @@ class Ssmconnector extends Module
         }
 
         return [$scheme . '://' . $host . (isset($parts['port']) ? ':' . (int) $parts['port'] : '') . (isset($parts['path']) ? rtrim($parts['path'], '/') : ''), null];
+    }
+
+    /** Caractères ASCII visibles uniquement : le token est envoyé dans un en-tête HTTP. */
+    private function isValidToken($token)
+    {
+        return (bool) preg_match('/^[\x21-\x7E]{16,512}$/', $token);
     }
 
     // === Protection des formulaires (CSRF) ===
@@ -819,7 +833,7 @@ class Ssmconnector extends Module
             return $this->l('Certificat HTTPS invalide ou non reconnu par ce serveur : la connexion est refusée par sécurité.');
         }
         if ($http_code === 401 || $http_code === 403) {
-            return $this->l('Token refusé par SSM Core : ajoutez cette boutique dans le tableau de bord SSM avec le token ci-dessus.');
+            return $this->l('Token refusé par SSM Core : vérifiez que le token ci-dessous est exactement celui fourni par SSM Core pour cette boutique (copier-coller, sans espace).');
         }
         if ($http_code === 404) {
             return $this->l('L\'API SSM est introuvable à cette adresse : vérifiez l\'adresse de SSM Core.');
