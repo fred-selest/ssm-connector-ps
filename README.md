@@ -56,13 +56,12 @@ Le heartbeat n'est envoyé que si l'intervalle configuré est écoulé ; ajouter
 
 **Installation de la mise à jour.** Elle reste manuelle : remplacer le dossier `modules/ssmconnector/` par le contenu de `ssmconnector.zip`, puis lancer la mise à jour du module dans le gestionnaire de modules. Les scripts du dossier `upgrade/` s'exécutent alors (le script `upgrade-0.3.0.php` ajoute les réglages manquants, enregistre les hooks et répare la file d'événements). Le token et la configuration sont conservés.
 
-**Publier une version** (mainteneurs) : mettre à jour la version dans `ssmconnector.php` et `config.xml`, ajouter si besoin `upgrade/upgrade-X.Y.Z.php`, puis :
+**Publier une version** (mainteneurs) : mettre à jour la version dans `ssmconnector.php` et `config.xml`, ajouter si besoin `upgrade/upgrade-X.Y.Z.php`, fusionner dans `main`, puis au choix :
 
-```bash
-git tag vX.Y.Z && git push origin vX.Y.Z
-```
+- en ligne de commande : `git tag vX.Y.Z && git push origin vX.Y.Z` ;
+- depuis l'interface GitHub : *Releases → Draft a new release*, créer le tag `vX.Y.Z` sur `main`, puis *Publish release*.
 
-Le workflow `.github/workflows/release.yml` vérifie la syntaxe PHP, contrôle que le tag correspond à la version du module, construit `ssmconnector.zip` (dossier racine `ssmconnector/`) et crée la release GitHub.
+Dans les deux cas, le workflow `.github/workflows/release.yml` vérifie la syntaxe PHP, contrôle que le tag correspond à la version du module, construit `ssmconnector.zip` (dossier racine `ssmconnector/`) et le joint à la release (qu'il crée si elle n'existe pas). Une release publiée sans archive après un échec du workflow se corrige en relançant le job depuis l'onglet Actions.
 
 ## Développement
 
