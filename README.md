@@ -4,7 +4,7 @@
 
 Module natif PrestaShop (8.x, 9.x visé) qui relie la boutique à **SSM Core** (Selest Site Manager) : il lui envoie l'inventaire (modules, thèmes, versions), des compteurs de base et un journal d'événements. Il ne modifie rien dans la boutique.
 
-Version actuelle : **0.4.2** ([notes de version](CHANGELOG.md))
+Version actuelle : **0.5.0** ([notes de version](CHANGELOG.md))
 
 ## Aperçu
 
@@ -34,12 +34,15 @@ Le module envoie périodiquement un *heartbeat* (`POST {adresse SSM}/api/v1/hear
 
 - version de PrestaShop, de PHP (au format `X.Y.Z`) et de la base, serveur web, nom de la machine, chemin d'installation ;
 - liste des modules (clé `extensions`) et des thèmes : identifiant, nom, version, actif / inactif ;
-- informations complémentaires que SSM Core ne lit pas encore : mode debug, mode maintenance, SSL, multiboutique, compteurs (clients, produits, commandes, employés) ;
-- les événements survenus depuis le dernier envoi (connexion réussie d'un client, tentatives de connexion, commandes, mises à jour produit, installation / désinstallation de module) : seulement des identifiants, jamais d'adresse e-mail. SSM Core ne les exploite pas encore. La file est limitée à 100 événements, les répétitions rapprochées sont regroupées, et elle n'est vidée qu'après un envoi réussi.
+- **état de la boutique**, lu par SSM Core depuis la 2.7.0 : mode debug, mode maintenance, SSL, multiboutique, URL de la boutique ;
+- **compteurs métier** : clients, produits, commandes, employés (avec leur évolution quotidienne côté SSM) ;
+- **version du connecteur** : `connector_version`, `latest_connector_version`, `connector_update_available`.
 
-Les champs lus par SSM Core sont tronqués à ses limites (sinon il refuse tout l'inventaire).
+Tous les champs sont tronqués aux limites de SSM Core : un champ trop long ferait refuser **tout** l'inventaire en 422, pas seulement lui.
 
-Un badge **SSM: OK / KO** est affiché dans l'en-tête du back-office.
+Les événements (connexion réussie d'un client, tentatives de connexion, commandes, mises à jour produit, installation / désinstallation de module) sont **désactivés par défaut**. SSM Core ne les exploite pas encore — son schéma les ignore volontairement — alors que la file contient des identifiants de personnes. La case « Envoyer les événements » permet de les réactiver si SSM Core venait à les consommer ; elle est off par défaut, y compris à l'installation. Quand elle est active : seulement des identifiants, jamais d'adresse e-mail, file limitée à 100 événements, répétitions rapprochées regroupées, vidage après un envoi réussi uniquement.
+
+Un badge **SSM: OK / KO** est affiché dans l'en-tête du back-office. La page de configuration indique le numéro de site reconnu par SSM Core — c'est la confirmation que le token collé est bien celui de cette boutique.
 
 ### Envoi automatique
 
@@ -65,7 +68,7 @@ Le heartbeat n'est envoyé que si l'intervalle configuré est écoulé ; ajouter
 - **Token** : celui que SSM Core a généré pour la boutique (le module n'en invente plus). Il est saisi dans un champ masqué, **jamais réécrit dans la page** (4 derniers caractères seulement), jamais cité dans un message d'erreur, et envoyé dans l'en-tête `X-SSM-Token` de chaque envoi. Seuls les caractères ASCII visibles sont acceptés (32 à 256), ce qui exclut toute injection dans les en-têtes HTTP.
 - **Point d'entrée cron** : token en en-tête uniquement, comparaison à temps constant, **blocage 15 minutes après 10 échecs** depuis la même adresse IP (réponse `429`). L'adresse IP n'est jamais stockée en clair, seulement son condensat.
 - **Back-office** : chaque action de la page de configuration est protégée par un jeton anti-CSRF propre à l'employé, en plus de celui de PrestaShop ; toutes les sorties sont échappées. L'accès à la page reste régi par les droits PrestaShop sur les modules.
-- **Données envoyées** : voir la liste ci-dessus. Aucun mot de passe, aucun contenu de commande, aucune donnée client : seulement des identifiants (n° de client, de commande, de produit) et des compteurs.
+- **Données envoyées** : voir la liste ci-dessus. Aucun mot de passe, aucun contenu de commande, aucune donnée client : seulement des identifiants (n° de client, de commande, de produit) et des compteurs — et les identifiants seulement si l'envoi d'événements a été activé.
 
 Limites à connaître :
 

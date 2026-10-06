@@ -2,6 +2,27 @@
 
 Format inspiré de [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/), versions sémantiques.
 
+## [0.5.0]
+
+Aligné sur SSM Core 2.7.0, qui lit enfin l'état de la boutique et les compteurs que le module envoyait déjà. Trois défauts d'alignement corrigés au passage.
+
+### Corrigé
+
+- **Une URL de boutique trop longue faisait refuser tout l'inventaire (422).** `shop_url` partait sans coupure alors que SSM Core l'accepte sur 255 caractères au maximum. Toutes les autres valeurs étaient tronquées ; celle-ci seule avait été oubliée — il suffisait d'un nom de domaine inhabituellement long pour que la boutique passe « hors ligne » dans SSM. Elle est maintenant tronquée comme les autres.
+- **Un module au nom vide faisait de même.** SSM Core exige un `slug` non vide (`min_length=1`) : une ligne illisible dans la table des modules suffisait à faire refuser l'inventaire complet. Le module au nom vide — et le thème au nom vide — sont écartés de l'envoi, pas transmis.
+- **Les compteurs métier étaient transmis sans borne.** SSM Core les accepte entre 0 et 2 000 000 000 ; hors de ces bornes, c'est tout l'inventaire qui est refusé, pas seulement le compteur. Les valeurs sont maintenant bornées, et un compteur négatif ne peut plus Injecter une valeur absurde.
+- **Les messages d'erreur ne reconnaissaient pas deux réponses possibles de SSM Core** : `409` (deux envois simultanés pour la même boutique — rien n'est perdu, le prochain envoi repart) et `413` (inventaire trop volumineux). Les deux tombaient sur « réponse inattendue ».
+
+### Modifié
+
+- **Les événements sont désactivés par défaut.** SSM Core ne les exploite pas : son schéma les déclare volontairement absents, et le connecteur WordPress avait supprimé sa file pour la même raison. Le module, lui, écrivait en base à chaque mise à jour produit et envoyait des numéros de client, de commande et de tentatives de connexion — des identifiants de personnes, pour un service qui les jette. Une case « Envoyer les événements » permet de les réactiver si SSM Core vient à les consommer. À l'installation comme à la mise à jour, la file existante est vidée.
+- Le module lit le `site_id` renvoyé par SSM Core et l'affiche dans la page de configuration : c'est la confirmation immédiate que le token collé est bien celui de **cette** boutique, et non celui d'une autre collé par erreur.
+- Le README ne décrit plus comme « non lus par SSM Core » l'état de la boutique et les compteurs, qu'il lit depuis la 2.7.0.
+
+### Ajouté
+
+- Tests pour chacun de ces points (URL trop longue, nom vide, compteurs hors bornes, 409/413, site reconnu, événements désactivés) : 248 vérifications.
+
 ## [0.4.2] - 2026-10-05
 
 Le module envoie enfin l'inventaire que SSM Core lit, et ne montre plus jamais le token.

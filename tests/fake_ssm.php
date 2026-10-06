@@ -20,4 +20,10 @@ if ($status >= 300 && $status < 400) {
     header('Location: https://ailleurs.example/api/v1/heartbeat');
 }
 header('Content-Type: application/json');
-echo $body !== '' ? $body : '{}';
+// Par défaut, la réponse ressemble à celle du vrai SSM Core (HeartbeatResponse) : sans `site_id`
+// le test de reconnaissance du site ne testerait jamais rien.
+if ($body === '') {
+    echo json_encode(['site_id' => 42, 'status' => 'accepted', 'inventory_id' => null, 'updates_pending' => 0, 'next_heartbeat_in' => 1800]);
+} else {
+    echo $body;
+}

@@ -4,7 +4,7 @@
  *
  * @author  Selest Informatique
  * @license MIT
- * @version 0.4.2
+ * @version 0.5.0
  */
 
 if (!defined('_PS_VERSION_')) {
@@ -24,6 +24,8 @@ class Ssmconnector extends Module
     const TOKEN_MAX = 256;
     const AUTO_TIMEOUT = 5;         // secondes : envoi automatique (ne doit jamais retenir longtemps une page)
     const EVENT_THROTTLE = 60;      // secondes : un même événement n'est pas répété plus vite
+    const MAX_COUNTER = 2000000000; // plafond des compteurs métier (app/schemas.py, SiteStats)
+    const URL_MAX = 255;            // longueur maximale de shop_url acceptée par SSM Core
     const UPDATE_REPO = 'fred-selest/ssm-connector-ps';
     const UPDATE_TTL = 43200;
 
@@ -31,7 +33,7 @@ class Ssmconnector extends Module
     {
         $this->name = 'ssmconnector';
         $this->tab = 'administration';
-        $this->version = '0.4.2';
+        $this->version = '0.5.0';
         $this->author = 'Selest Informatique';
         $this->need_instance = 0;
         $this->ps_versions_compliancy = ['min' => '8.0.0', 'max' => _PS_VERSION_];
@@ -52,7 +54,7 @@ class Ssmconnector extends Module
         foreach ([
             'SSM_SSM_URL', 'SSM_HEARTBEAT_INTERVAL', 'SSM_AUTO_HEARTBEAT', 'SSM_LAST_HEARTBEAT_AT',
             'SSM_HEARTBEAT_OK', 'SSM_LAST_ERROR', 'SSM_HEARTBEAT_LOCK', 'SSM_CONNECTOR_TOKEN',
-            'SSM_PENDING_EVENTS', 'SSM_UPDATE_CACHE', 'SSM_CRON_FAILS',
+            'SSM_PENDING_EVENTS', 'SSM_SEND_EVENTS', 'SSM_UPDATE_CACHE', 'SSM_CRON_FAILS', 'SSM_SITE_ID',
         ] as $key) {
             Configuration::deleteByName($key);
         }
@@ -74,6 +76,11 @@ class Ssmconnector extends Module
             'SSM_LAST_ERROR' => '',
             'SSM_HEARTBEAT_LOCK' => 0,
             'SSM_CRON_FAILS' => '{}',
+            // Les événements sont désactivés par défaut : SSM Core ne les lit pas (app/schemas.py,
+            // HeartbeatRequest) et la file contient des identifiants de personnes. Les activer
+            // reste possible si SSM Core décide un jour de les consommer.
+            'SSM_SEND_EVENTS' => 0,
+            'SSM_SITE_ID' => 0,
         ];
         foreach ($defaults as $key => $value) {
             if (Configuration::get($key) === false) {
@@ -212,6 +219,12 @@ class Ssmconnector extends Module
             . $this->h($this->l('Envoi automatique (recommandé) : aucune tâche cron à configurer'))
             . '</label></div>';
 
+        $events = (bool) Configuration::get('SSM_SEND_EVENTS');
+        $output .= '<div class="checkbox"><label><input type="checkbox" name="SSM_SEND_EVENTS" value="1"' . ($events ? ' checked' : '') . '> '
+            . $this->h($this->l('Envoyer les événements (connexions, commandes, modules)'))
+            . '</label></div>';
+        $output .= '<p class="help-block">' . $this->h($this->l('Désactivé par défaut : SSM Core ne les exploite pas encore, et ces événements contiennent des identifiants de personnes. À n\'activer que si vous savez qu\'ils sont utilisés.')) . '</p>';
+
         $output .= '<button type="submit" name="submitSSMConfig" class="btn btn-primary">Enregistrer et tester la connexion</button> ';
         $output .= '<button type="submit" name="submitSSMHeartbeatNow" class="btn btn-default">Tester maintenant</button> ';
         $output .= '<button type="submit" name="submitSSMCheckUpdate" class="btn btn-default">Vérifier les mises à jour</button>';
@@ -262,6 +275,7 @@ class Ssmconnector extends Module
                 Configuration::updateValue('SSM_SSM_URL', $url);
                 Configuration::updateValue('SSM_HEARTBEAT_INTERVAL', $this->clampInterval((int) Tools::getValue('SSM_HEARTBEAT_INTERVAL')));
                 Configuration::updateValue('SSM_AUTO_HEARTBEAT', Tools::getValue('SSM_AUTO_HEARTBEAT') ? 1 : 0);
+                Configuration::updateValue('SSM_SEND_EVENTS', Tools::getValue('SSM_SEND_EVENTS') ? 1 : 0);
                 return $this->displayConfirmation($this->l('Configuration enregistrée')) . $this->testConnection();
 
             case 'submitSSMHeartbeatNow':
@@ -292,7 +306,11 @@ class Ssmconnector extends Module
                 . '2) collez ci-dessous l\'adresse de SSM Core et ce token ; '
                 . '3) cliquez sur <strong>Enregistrer et tester la connexion</strong>.</div>';
         } elseif ($ok) {
-            $banner = '<div class="alert alert-success"><strong>Connecté à SSM Core</strong>' . ($last ? ' — dernier échange le ' . $this->h($last) : '') . '</div>';
+            $site_id = (int) Configuration::get('SSM_SITE_ID');
+            $banner = '<div class="alert alert-success"><strong>Connecté à SSM Core</strong>'
+                . ($last ? ' — dernier échange le ' . $this->h($last) : '')
+                . ($site_id > 0 ? ' — site <strong>n° ' . $site_id . '</strong>' : '')
+                . '</div>';
         } else {
             $banner = '<div class="alert alert-danger"><strong>Non connecté.</strong> '
                 . $this->h($error !== '' ? $error : $this->l('Aucun échange réussi pour le moment : cliquez sur « Enregistrer et tester la connexion ».')) . '</div>';
@@ -521,6 +539,11 @@ class Ssmconnector extends Module
         Configuration::updateValue('SSM_HEARTBEAT_OK', $result['ok'] ? 1 : 0);
         Configuration::updateValue('SSM_LAST_HEARTBEAT_AT', date('Y-m-d H:i:s'));
         Configuration::updateValue('SSM_LAST_ERROR', $result['ok'] ? '' : $result['hint']);
+        // SSM Core répond avec l'identifiant du site reconnu par le token : on l'affiche, c'est
+        // la façon de confirmer d'un coup d'œil que le token collé est bien celui de CETTE boutique.
+        if ($result['ok'] && isset($result['site_id'])) {
+            Configuration::updateValue('SSM_SITE_ID', (int) $result['site_id']);
+        }
         return $result;
     }
 
@@ -578,8 +601,22 @@ class Ssmconnector extends Module
     }
 
     /**
+     * Compteur métier borné aux limites de SSM Core (0 à MAX_COUNTER, app/schemas.py) : une
+     * valeur hors bornes fait refuser tout l'inventaire en 422, pas seulement le compteur.
+     */
+    private function counter($value)
+    {
+        $value = (int) $value;
+        if ($value < 0) {
+            return 0;
+        }
+        return min($value, self::MAX_COUNTER);
+    }
+
+    /**
      * Inventaire envoyé à SSM Core. Les clés lues par SSM Core sont en tête (cms_version, php_version, db_version, web_server,
-     * hostname, site_path, extensions, themes) ; le reste est informatif. Les longueurs sont celles de SSM Core (app/schemas.py).
+     * hostname, site_path, extensions, themes) ; le reste est ce que SSM Core lit désormais (2.7.0) ou conserve à titre
+     * informatif. Les longueurs sont celles de SSM Core (app/schemas.py).
      */
     private function collectInventory()
     {
@@ -587,9 +624,15 @@ class Ssmconnector extends Module
         $extensions = [];
         $all_modules = $db->executeS('SELECT name, version, active FROM ' . _DB_PREFIX_ . 'module') ?: [];
         foreach ($all_modules as $m) {
+            $slug = $this->cut($m['name'], 255);
+            // SSM Core exige un slug non vide (min_length=1) : une ligne illisible ferait
+            // refuser tout l'inventaire, on l'écarte donc plutôt que de tout casser.
+            if ($slug === '') {
+                continue;
+            }
             $extensions[] = [
-                'slug' => $this->cut($m['name'], 255),
-                'name' => $this->cut($m['name'], 255),
+                'slug' => $slug,
+                'name' => $slug,
                 'version' => $this->cutOrNull($m['version'], 50),
                 'is_active' => (bool) $m['active'],
             ];
@@ -603,10 +646,10 @@ class Ssmconnector extends Module
         $update = $this->getUpdateInfo();
 
         $stats = [
-            'customers' => (int) $db->getValue('SELECT COUNT(*) FROM ' . _DB_PREFIX_ . 'customer'),
-            'products' => (int) $db->getValue('SELECT COUNT(*) FROM ' . _DB_PREFIX_ . 'product'),
-            'orders' => (int) $db->getValue('SELECT COUNT(*) FROM ' . _DB_PREFIX_ . 'orders'),
-            'employees' => (int) $db->getValue('SELECT COUNT(*) FROM ' . _DB_PREFIX_ . 'employee'),
+            'customers' => $this->counter($db->getValue('SELECT COUNT(*) FROM ' . _DB_PREFIX_ . 'customer')),
+            'products' => $this->counter($db->getValue('SELECT COUNT(*) FROM ' . _DB_PREFIX_ . 'product')),
+            'orders' => $this->counter($db->getValue('SELECT COUNT(*) FROM ' . _DB_PREFIX_ . 'orders')),
+            'employees' => $this->counter($db->getValue('SELECT COUNT(*) FROM ' . _DB_PREFIX_ . 'employee')),
         ];
 
         return [
@@ -619,20 +662,23 @@ class Ssmconnector extends Module
             'site_path' => defined('_PS_ROOT_DIR_') ? $this->cutOrNull(_PS_ROOT_DIR_, 500) : null,
             'extensions' => $extensions,
             'themes' => $themes,
-            // informatifs (ignorés par SSM Core pour l'instant)
+            // état de la boutique, lu par SSM Core depuis la 2.7.0
             'cms' => 'prestashop',
             'multistore' => (bool) Shop::isFeatureActive(),
-            'shop_url' => Tools::getShopDomain(true),
+            'shop_url' => $this->cutOrNull(Tools::getShopDomain(true), self::URL_MAX),
             'ssl_enabled' => (bool) Configuration::get('PS_SSL_ENABLED'),
             'debug_mode' => (bool) _PS_MODE_DEV_,
             'maintenance_mode' => !(bool) Configuration::get('PS_SHOP_ENABLE'),
+            // version du connecteur, lue par SSM Core depuis la 2.7.0
+            'connector_version' => $this->version,
+            'latest_connector_version' => $this->cutOrNull($update['latest'], 20),
+            'connector_update_available' => (bool) $update['available'],
+            // compteurs métier, lus par SSM Core depuis la 2.7.0
+            'stats' => $stats,
+            // informatifs (conservés, pas encore lus)
             'module_count' => count($extensions),
             'module_active_count' => $active_count,
             'theme_count' => count($themes),
-            'stats' => $stats,
-            'connector_version' => $this->version,
-            'latest_connector_version' => $update['latest'],
-            'connector_update_available' => $update['available'],
             'timestamp' => date('c'),
         ];
     }
@@ -646,10 +692,13 @@ class Ssmconnector extends Module
 
             if (method_exists('Theme', 'getThemes')) {
                 foreach (Theme::getThemes() as $theme) {
-                    $slug = !empty($theme->directory) ? $theme->directory : $theme->name;
+                    $slug = $this->cut(!empty($theme->directory) ? $theme->directory : $theme->name, 255);
+                    if ($slug === '') {
+                        continue;   // slug exigé non vide par SSM Core
+                    }
                     $version = method_exists($theme, 'getVersion') ? $theme->getVersion() : null;
                     $themes[] = [
-                        'slug' => $this->cut($slug, 255),
+                        'slug' => $slug,
                         'name' => $this->cut($theme->name, 255),
                         'version' => $this->cut($version ?: '1.0', 50),
                         'is_active' => $slug === $active,
@@ -800,12 +849,21 @@ class Ssmconnector extends Module
     }
 
     /**
-     * Met un événement en file. Un événement identique au précédent, à moins d'une minute, n'est pas répété
-     * (ou, avec $throttle, tout événement du même type) : une attaque par force brute ou un import de produits
-     * n'écrit pas en base à chaque requête.
+     * Met un événement en file, si l'envoi d'événements est activé. Un événement identique au
+     * précédent, à moins d'une minute, n'est pas répété (ou, avec $throttle, tout événement du
+     * même type) : une attaque par force brute ou un import de produits n'écrit pas en base à
+     * chaque requête.
+     *
+     * Désactivé par défaut : SSM Core ne consomme pas ces événements (app/schemas.py) alors que
+     * la file contient des identifiants de personnes. Tant que SSM Core ne les exploite pas, les
+     * écrire en base à chaque mise à jour produit n'a aucun intérêt et garde des identifiants
+     * clients et commandes pour rien.
      */
     private function queueEvent($type, $payload, $throttle = false)
     {
+        if (!Configuration::get('SSM_SEND_EVENTS')) {
+            return;
+        }
         $events = $this->getPendingEvents();
         $last = end($events);
         if (is_array($last) && isset($last['type'], $last['timestamp']) && $last['type'] === $type
@@ -832,7 +890,9 @@ class Ssmconnector extends Module
             return ['ok' => false, 'http_code' => 0, 'hint' => $this->l('Token manquant : collez le token de cette boutique (dans SSM Core : Sites, bouton 🔌).')];
         }
         $events = $this->getPendingEvents();
-        $body['pending_events'] = $events;
+        if ($events) {
+            $body['pending_events'] = $events;
+        }
 
         $payload = json_encode($body, JSON_INVALID_UTF8_SUBSTITUTE);
         if ($payload === false) {
@@ -868,7 +928,14 @@ class Ssmconnector extends Module
 
         // Succès : on retire uniquement les événements envoyés (d'autres ont pu être ajoutés entre-temps)
         $this->setPendingEvents(array_slice($this->getPendingEvents(), count($events)));
-        return ['ok' => true, 'http_code' => $http_code, 'hint' => ''];
+
+        $json = json_decode((string) $response, true);
+        return [
+            'ok' => true,
+            'http_code' => $http_code,
+            'hint' => '',
+            'site_id' => is_array($json) && isset($json['site_id']) ? (int) $json['site_id'] : null,
+        ];
     }
 
     /** Explique un échec d'envoi en langage clair, avec l'action à mener. Ne cite jamais le token. */
@@ -904,6 +971,14 @@ class Ssmconnector extends Module
         }
         if ($http_code === 429) {
             return $this->l('SSM Core limite temporairement les envois de cette boutique : réessayez dans quelques minutes.');
+        }
+        if ($http_code === 409) {
+            // SSM Core refuse deux heartbeats simultanés pour la même boutique (IntegrityError).
+            // C'est passager : l'inventaire n'est ni perdu ni corrompu, seul l'envoi est à refaire.
+            return $this->l('Un envoi était déjà en cours côté SSM Core (409) : rien n\'est perdu, le prochain envoi repart normalement.');
+        }
+        if ($http_code === 413) {
+            return $this->l('Inventaire trop volumineux pour SSM Core (413) : la boutique a un nombre inhabituel de modules ou de thèmes.');
         }
         if ($http_code >= 300 && $http_code < 400) {
             return $this->l('SSM Core redirige vers une autre adresse (non suivie par sécurité) : utilisez l\'adresse finale en https://.');
