@@ -2,6 +2,34 @@
 
 Format inspiré de [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/), versions sémantiques.
 
+## [0.5.0]
+
+Aligné sur SSM Core 2.7.0, qui lit enfin l'état de la boutique et les compteurs que le module envoyait déjà. Trois défauts d'alignement corrigés au passage.
+
+### Corrigé
+
+- **Une URL de boutique trop longue faisait refuser tout l'inventaire (422).** `shop_url` partait sans coupure alors que SSM Core l'accepte sur 255 caractères au maximum. Toutes les autres valeurs étaient tronquées ; celle-ci seule avait été oubliée — il suffisait d'un nom de domaine inhabituellement long pour que la boutique passe « hors ligne » dans SSM. Elle est maintenant tronquée comme les autres.
+- **Un module au nom vide faisait de même.** SSM Core exige un `slug` non vide (`min_length=1`) : une ligne illisible dans la table des modules suffisait à faire refuser l'inventaire complet. Le module au nom vide — et le thème au nom vide — sont écartés de l'envoi, pas transmis.
+- **Les compteurs métier étaient transmis sans borne.** SSM Core les accepte entre 0 et 2 000 000 000 ; hors de ces bornes, c'est tout l'inventaire qui est refusé, pas seulement le compteur. Les valeurs sont maintenant bornées, et un compteur négatif ne peut plus Injecter une valeur absurde.
+- **Les messages d'erreur ne reconnaissaient pas deux réponses possibles de SSM Core** : `409` (deux envois simultanés pour la même boutique — rien n'est perdu, le prochain envoi repart) et `413` (inventaire trop volumineux). Les deux tombaient sur « réponse inattendue ».
+
+### Sécurité
+
+- **Le détail d'erreur renvoyé par SSM Core était rendu sans échappement dans le back-office.** Sur un `422`, le champ `msg` du serveur était recopié tel quel dans le message affiché, sans passer par l'échappement que subit tout le reste de la page. SSM Core étant auto-hébergé, une instance hostile ou compromise pouvait exécuter du script dans le back-office PrestaShop. Le balisage est maintenant retiré du texte avant affichage.
+- **Décocher « envoyer les événements » n'arrêtait pas l'envoi.** Le réglage ne gouvernait que la mise en file : une file déjà pleine continuait d'être transmise, et repartait à chaque envoi. C'était le cas le plus probable en pratique — une file pleine au moment du décochement. Le drapeau gouverne désormais aussi l'envoi, et le décochement vide la file.
+- **Un réglage absent n'est plus rapporté « désactivé ».** Quand la clé `PS_SSL_ENABLED` n'existe pas encore (installation fraîche), le module annonçait « SSL désactivé » alors que personne n'avait rien déclaré : il ne rapporte plus rien du tout, ce qu'SSM Core 2.7.0 sait distinguer des autres connecteurs.
+
+### Modifié
+
+- **Les événements sont désactivés par défaut.** SSM Core ne les exploite pas : son schéma les déclare volontairement absents, et le connecteur WordPress avait supprimé sa file pour la même raison. Le module, lui, écrivait en base à chaque mise à jour produit et envoyait des numéros de client, de commande et de tentatives de connexion — des identifiants de personnes, pour un service qui les jette. Une case « Envoyer les événements » permet de les réactiver si SSM Core vient à les consommer. À l'installation comme à la mise à jour, la file existante est vidée.
+- Le module lit le `site_id` renvoyé par SSM Core et l'affiche dans la page de configuration : c'est la confirmation immédiate que le token collé est bien celui de **cette** boutique, et non celui d'une autre collé par erreur.
+- Le README ne décrit plus comme « non lus par SSM Core » l'état de la boutique et les compteurs, qu'il lit depuis la 2.7.0.
+
+### Ajouté
+
+- Tests pour chacun de ces points (URL trop longue, nom vide, compteurs hors bornes, 409/413, site reconnu, événements désactivés) et pour chacun des correctifs de sécurité : **303 vérifications**. Chaque test a été validé en réintroduisant le bug qu'il couvre, pour vérifier qu'il échoue vraiment.
+- Un test exécute réellement la mise à jour `0.4.2 → 0.5.0` sur une boutique existante (deux passes) : c'est l'opération la plus risquée pour un marchand, elle ne dépend pas d'une simple vérification de présence de fichier.
+
 ## [0.4.2] - 2026-10-05
 
 Le module envoie enfin l'inventaire que SSM Core lit, et ne montre plus jamais le token.

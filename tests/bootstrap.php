@@ -19,9 +19,19 @@ class Configuration
 class Db
 {
     public static $modules = [];
+    public static $counts = null;   // valeurs renvoyées par getValue(), dans l'ordre des COUNT(*) testés
+    private $count_index = 0;
     public static function getInstance() { return new self(); }
     public function executeS($sql) { return self::$modules; }
-    public function getValue($sql) { return '12'; }
+    public function getValue($sql)
+    {
+        if (self::$counts === null) {
+            return '12';
+        }
+        $v = self::$counts[$this->count_index] ?? 0;
+        $this->count_index++;
+        return $v;
+    }
     public function getVersion() { return '8.0.36'; }
 }
 
@@ -31,7 +41,8 @@ class Tools
 {
     public static $values = [];
     public static $submitted = [];
-    public static function getShopDomain($ssl = false) { return 'https://boutique.exemple.fr'; }
+    public static $shop_domain = 'https://boutique.exemple.fr';
+    public static function getShopDomain($ssl = false) { return self::$shop_domain; }
     public static function substr($s, $a, $b) { return substr($s, $a, $b); }
     public static function getValue($k) { return isset(self::$values[$k]) ? self::$values[$k] : null; }
     public static function isSubmit($k) { return in_array($k, self::$submitted, true); }
