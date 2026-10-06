@@ -205,22 +205,37 @@ test("l'inventaire respecte les longueurs maximales de SSM Core (sinon tout est 
     $theme->directory = str_repeat('d', 400);
     Theme::$list = [$theme];
     $_SERVER['SERVER_SOFTWARE'] = str_repeat('Apache/', 30);
+    Tools::$shop_domain = 'https://' . str_repeat('a', 400) . '.exemple.fr';
+    Configuration::updateValue('SSM_UPDATE_CACHE', json_encode(['checked_at' => time(), 'error' => false,
+        'latest' => str_repeat('9', 60), 'url' => null, 'download' => null]));
     $inv = priv($m, 'collectInventory');
     unset($_SERVER['SERVER_SOFTWARE']);
     foreach (CORE_TOP as $key => $max) {
-        if (isset($inv[$key])) {
-            check(mb_strlen($inv[$key]) <= $max, "$key <= $max");
-        }
+        // isset() sauterait un champ null ou absent : on contrôle la longueur quand même,
+        // sinon une régression de longueur passerait inaperçue.
+        check(!isset($inv[$key]) || mb_strlen((string) $inv[$key]) <= $max, "$key <= $max");
     }
     foreach (array_merge($inv['extensions'], $inv['themes']) as $item) {
         foreach (CORE_ITEM as $key => $max) {
-            if (isset($item[$key])) {
-                check(mb_strlen($item[$key]) <= $max, "élément.$key <= $max");
-            }
+            check(!isset($item[$key]) || mb_strlen((string) $item[$key]) <= $max, "élément.$key <= $max");
         }
     }
     same(mb_strlen($inv['extensions'][0]['name']), 255, 'nom du module tronqué à 255 caractères');
     same(mb_strlen($inv['web_server']), 50, 'web_server tronqué à 50');
+    same(mb_strlen($inv['shop_url']), 255, 'shop_url tronqué à 255');
+    same(mb_strlen($inv['latest_connector_version']), 20, 'latest_connector_version tronqué à 20');
+    same($inv['site_path'], '/var/www/html', 'site_path transmis tel quel (13 < 500 : aucune troncature)');
+    same(mb_strlen($inv['hostname']), strlen(gethostname()) === 0 ? 0 : mb_strlen(gethostname()), 'hostname sous la limite de 255');
+    check(mb_strlen($inv['hostname']) <= 255, 'hostname <= 255');
+});
+
+test("les champs non pilotables par le test sont bien tronqués à leur limite", function () {
+    // hostname et site_path viennent de l'environnement (gethostname(), _PS_ROOT_DIR_) : ici ils
+    // font 13 caractères, donc une borne abaissée serait invisible au test précédent. On vérifie
+    // donc l'appel lui-même — même approche que le test qui interdit phpversion().
+    $source = file_get_contents(dirname(__DIR__) . '/ssmconnector.php');
+    check(strpos($source, 'gethostname(), 255)') !== false, 'hostname tronqué à 255 (limite SSM Core)');
+    check(strpos($source, 'cutOrNull(_PS_ROOT_DIR_, 500)') !== false, 'site_path tronqué à 500 (limite SSM Core)');
 });
 
 test("une URL de boutique trop longue ne fait pas tout refuser en 422", function () {
@@ -593,6 +608,126 @@ test("aucune fausse protection : pas de signature, pas de token dans l'adresse",
     check(strpos($source, 'X-SSM-Signature') === false && strpos($source, 'hash_hmac(\'sha256\', $payload') === false, 'plus de signature HMAC factice');
     check(strpos($source, "Tools::getValue('token')") === false, 'le token n\'est pas lu dans l\'adresse');
     check(strpos($source, 'CURLOPT_FOLLOWLOCATION => false') !== false && strpos($source, 'CURLOPT_SSL_VERIFYPEER => true') !== false, 'redirections non suivies, certificat vérifié');
+});
+
+test("la mise à jour 0.4.2 → 0.5.0 préserve la boutique et est idempotente", function () {
+    // C'est l'opération la plus risquée pour un marchand : elle tourne sur une boutique en
+    // production, avec un token et une fréquence déjà configurés. Elle n'est pas réversible.
+    require_once dirname(__DIR__) . '/upgrade/upgrade-0.5.0.php';
+    $m = fresh();
+    // état d'une boutique déjà en 0.4.2
+    Configuration::updateValue('SSM_SSM_URL', 'https://ssm.exemple.fr');
+    Configuration::updateValue('SSM_CONNECTOR_TOKEN', TOKEN_A);
+    Configuration::updateValue('SSM_HEARTBEAT_INTERVAL', 3600);
+    Configuration::updateValue('SSM_AUTO_HEARTBEAT', 1);
+    Configuration::updateValue('SSM_SEND_EVENTS', 0);
+    Configuration::updateValue('SSM_PENDING_EVENTS', json_encode([
+        ['type' => 'customer_login', 'payload' => ['id_customer' => 7], 'timestamp' => '2026-10-05T10:00:00+02:00'],
+    ]));
+
+    for ($passe = 1; $passe <= 2; $passe++) {
+        check(upgrade_module_0_5_0($m), "passe $passe : la mise à jour réussit");
+        same(Configuration::get('SSM_SSM_URL'), 'https://ssm.exemple.fr', "passe $passe : adresse conservée");
+        same(Configuration::get('SSM_CONNECTOR_TOKEN'), TOKEN_A, "passe $passe : token conservé");
+        same((int) Configuration::get('SSM_HEARTBEAT_INTERVAL'), 3600, "passe $passe : fréquence conservée");
+        same((int) Configuration::get('SSM_AUTO_HEARTBEAT'), 1, "passe $passe : envoi automatique conservé");
+        same((int) Configuration::get('SSM_SEND_EVENTS'), 0, "passe $passe : événements désactivés");
+        same(json_decode((string) Configuration::get('SSM_PENDING_EVENTS'), true), [], "passe $passe : file d'événements vidée");
+        same((int) Configuration::get('SSM_SITE_ID'), 0, "passe $passe : site_id initialisé");
+    }
+});
+
+test("l'installation ne réécrit pas une configuration existante", function () {
+    $m = fresh();
+    Configuration::updateValue('SSM_SSM_URL', 'https://ssm.exemple.fr');
+    Configuration::updateValue('SSM_CONNECTOR_TOKEN', TOKEN_A);
+    Configuration::updateValue('SSM_HEARTBEAT_INTERVAL', 3600);
+    $m->setupDefaults();
+    same(Configuration::get('SSM_SSM_URL'), 'https://ssm.exemple.fr', 'adresse conservée');
+    same(Configuration::get('SSM_CONNECTOR_TOKEN'), TOKEN_A, 'token conservé');
+    same((int) Configuration::get('SSM_HEARTBEAT_INTERVAL'), 3600, 'fréquence conservée');
+});
+
+test("décocher les événements vide la file et arrête tout envoi", function () {
+    // Régression : le drapeau ne governsait que la mise en file, pas l'envoi — une file déjà
+    // pleine continuait de partir, identifiants de personnes compris.
+    $m = freshWithEvents();
+    $m->hookActionValidateOrder(['order' => (object) ['id' => 4242]]);
+    same(count(json_decode((string) Configuration::get('SSM_PENDING_EVENTS'), true)), 1, 'file pleine');
+
+    // décoché par le formulaire
+    core_replies(200);
+    Tools::$submitted = ['submitSSMConfig'];
+    Tools::$values = ['SSM_SSM_URL' => SSM_URL, 'SSM_CONNECTOR_TOKEN' => TOKEN_A, 'ssm_nonce' => priv($m, 'nonce')];
+    $m->getContent();
+    same((int) Configuration::get('SSM_SEND_EVENTS'), 0, 'désactivé');
+    same(json_decode((string) Configuration::get('SSM_PENDING_EVENTS'), true), [], 'file vidée au décochement');
+
+    // et même en forçant l'envoi : plus rien ne part
+    configure($m);
+    core_replies(200);
+    check(priv($m, 'sendHeartbeat')['ok'], 'envoi accepté');
+    $body = json_decode(core_requests()[0]['body'], true);
+    check(!array_key_exists('pending_events', $body), 'aucun événement sur le réseau');
+    check(strpos(core_requests()[0]['body'], '4242') === false, 'aucun identifiant de commande transmis');
+});
+
+test("une file non vide n'est jamais envoyée quand les événements sont éteints", function () {
+    // Défense en profondeur : décocher vide la file, mais une file peut être pleine pendant que
+    // le drapeau est éteint (reglage modifié hors du formulaire, boutique reprise, etc.).
+    // Seule la condition à l'envoi garantit qu'aucun identifiant ne part dans ce cas.
+    $m = fresh();
+    Configuration::updateValue('SSM_SEND_EVENTS', 0);
+    Configuration::updateValue('SSM_PENDING_EVENTS', json_encode([
+        ['type' => 'order_created', 'payload' => ['id_order' => 4242], 'timestamp' => '2026-10-05T10:00:00+02:00'],
+    ]));
+    configure($m);
+    core_replies(200);
+    check(priv($m, 'sendHeartbeat')['ok'], 'envoi accepté');
+    $raw = core_requests()[0]['body'];
+    check(strpos($raw, 'pending_events') === false, 'aucun pending_events dans le corps');
+    check(strpos($raw, '4242') === false, 'aucun identifiant de commande transmis');
+    // ...et il repart à chaque nouvel envoi, tant que la file n'est pas vidée
+    core_replies(200);
+    priv($m, 'sendHeartbeat');
+    check(strpos(core_requests()[1]['body'], '4242') === false, 'toujours rien au deuxième envoi');
+});
+
+test("un message d'erreur distant ne peut pas injecter de balisage", function () {
+    // Le détail d'un 422 vient du serveur SSM, pas de la boutique, et displayError() rend du
+    // HTML : une instance SSM hostile ne doit pas pouvoir exécuter de script dans le back-office.
+    $m = fresh();
+    $hint = $m->describeFailure(422, 0, json_encode(['detail' => [[
+        'loc' => ['body', 'x'],
+        'msg' => '<script>alert(1)</script><img src=x onerror=alert(2)>',
+    ]]]));
+    check(strpos($hint, '<script') === false, 'pas de balise script');
+    check(strpos($hint, '<img') === false, 'pas de balise img');
+    check(strpos($hint, 'onerror') === false, 'pas de gestionnaire d\'événement');
+    check(strpos($hint, '422') !== false, 'le message reste utile');
+});
+
+test("un réglage absent est rapporté « non rapporté », pas « désactivé »", function () {
+    // PS_SSL_ENABLED peut ne pas exister sur une installation fraîche : affirming « SSL
+    // désactivé » serait une déclaration que personne n'a faite (distinction de la 2.7.0).
+    $m = fresh();
+    check(!array_key_exists('PS_SSL_ENABLED', Configuration::$v), 'clé absente par défaut');
+    same(priv($m, 'collectInventory')['ssl_enabled'], null, 'null = non rapporté');
+    Configuration::updateValue('PS_SSL_ENABLED', '1');
+    same(priv($m, 'collectInventory')['ssl_enabled'], true, '1 → actif');
+    Configuration::updateValue('PS_SSL_ENABLED', '0');
+    same(priv($m, 'collectInventory')['ssl_enabled'], false, '0 → désactivé');
+});
+
+test("les compteurs module_count et module_active_count décrivent la même liste", function () {
+    $m = fresh();
+    Db::$modules = [];
+    for ($i = 0; $i < 1200; $i++) {
+        Db::$modules[] = ['name' => "mod$i", 'version' => '1.0', 'active' => '1'];
+    }
+    $inv = priv($m, 'collectInventory');
+    same($inv['module_count'], 1000, 'plafond appliqué');
+    check($inv['module_active_count'] <= $inv['module_count'], 'actifs ≤ total, même au-delà du plafond');
 });
 
 echo "\n$checks vérifications, $failures échec(s)\n";

@@ -276,6 +276,11 @@ class Ssmconnector extends Module
                 Configuration::updateValue('SSM_HEARTBEAT_INTERVAL', $this->clampInterval((int) Tools::getValue('SSM_HEARTBEAT_INTERVAL')));
                 Configuration::updateValue('SSM_AUTO_HEARTBEAT', Tools::getValue('SSM_AUTO_HEARTBEAT') ? 1 : 0);
                 Configuration::updateValue('SSM_SEND_EVENTS', Tools::getValue('SSM_SEND_EVENTS') ? 1 : 0);
+                if (!Configuration::get('SSM_SEND_EVENTS')) {
+                    // Décoché : la file ne sera ni alimentée ni envoyée. Elle contient des
+                    // identifiants de personnes, on ne la garde pas en base pour rien.
+                    $this->setPendingEvents([]);
+                }
                 return $this->displayConfirmation($this->l('Configuration enregistrée')) . $this->testConnection();
 
             case 'submitSSMHeartbeatNow':
@@ -637,10 +642,12 @@ class Ssmconnector extends Module
                 'is_active' => (bool) $m['active'],
             ];
         }
+        // Plafond appliqué AVANT de compter, sinon module_count (après plafond) et
+        // module_active_count (avant plafond) ne décrivent pas la même liste.
+        $extensions = array_slice($extensions, 0, 1000);
         $active_count = count(array_filter($extensions, function ($m) {
             return $m['is_active'];
         }));
-        $extensions = array_slice($extensions, 0, 1000);
 
         $themes = array_slice($this->collectThemes(), 0, 200);
         $update = $this->getUpdateInfo();
@@ -651,6 +658,11 @@ class Ssmconnector extends Module
             'orders' => $this->counter($db->getValue('SELECT COUNT(*) FROM ' . _DB_PREFIX_ . 'orders')),
             'employees' => $this->counter($db->getValue('SELECT COUNT(*) FROM ' . _DB_PREFIX_ . 'employee')),
         ];
+
+        $ssl = Configuration::get('PS_SSL_ENABLED');
+        // Une installation fraîche peut ne pas encore avoir la clé : on rapporte alors « non
+        // rapporté » (null) plutôt que « SSL désactivé », qui serait une affirmation que
+        // personne n'a faite. SSM Core 2.7.0 fait précisément cette distinction.
 
         return [
             // lus par SSM Core
@@ -666,7 +678,7 @@ class Ssmconnector extends Module
             'cms' => 'prestashop',
             'multistore' => (bool) Shop::isFeatureActive(),
             'shop_url' => $this->cutOrNull(Tools::getShopDomain(true), self::URL_MAX),
-            'ssl_enabled' => (bool) Configuration::get('PS_SSL_ENABLED'),
+            'ssl_enabled' => $ssl === false ? null : (bool) $ssl,
             'debug_mode' => (bool) _PS_MODE_DEV_,
             'maintenance_mode' => !(bool) Configuration::get('PS_SHOP_ENABLE'),
             // version du connecteur, lue par SSM Core depuis la 2.7.0
@@ -889,7 +901,10 @@ class Ssmconnector extends Module
         if ($token === '') {
             return ['ok' => false, 'http_code' => 0, 'hint' => $this->l('Token manquant : collez le token de cette boutique (dans SSM Core : Sites, bouton 🔌).')];
         }
-        $events = $this->getPendingEvents();
+        // Le drapeau décide à la fois de la mise en file ET de l'envoi : une file déjà
+        // alimentée (avant désactivation, ou après un simple décochement) ne doit pas repartir
+        // toute seule. Elle est vidée au décochement, dans processForms().
+        $events = Configuration::get('SSM_SEND_EVENTS') ? $this->getPendingEvents() : [];
         if ($events) {
             $body['pending_events'] = $events;
         }
@@ -967,6 +982,11 @@ class Ssmconnector extends Module
                 $loc = isset($first['loc']) && is_array($first['loc']) ? implode('.', array_map('strval', $first['loc'])) : '';
                 $detail = trim($loc . ' ' . (isset($first['msg']) ? (string) $first['msg'] : ''));
             }
+            // Ce texte vient du serveur, pas de la boutique : il est rendu tel quel par
+            // displayError(). On retire donc tout balisage plutôt que de l'échapper — un
+            // échappement ici serait ré-échappé à l'affichage.
+            $detail = trim(strip_tags($detail));
+            $detail = preg_replace('/[\x00-\x1F\x7F]/u', '', $detail);
             return $this->l('Données refusées par SSM Core (422)') . ($detail !== '' ? ' : ' . $this->cut($detail, 200) : '') . '.';
         }
         if ($http_code === 429) {
