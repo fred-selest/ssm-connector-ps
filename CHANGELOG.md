@@ -27,7 +27,7 @@ Aligné sur SSM Core 2.7.0, qui lit enfin l'état de la boutique et les compteur
 
 ### Ajouté
 
-- Tests pour chacun de ces points (URL trop longue, nom vide, compteurs hors bornes, 409/413, site reconnu, événements désactivés) et pour chacun des correctifs de sécurité : **298 vérifications**. Chaque test a été validé en réintroduisant le bug qu'il couvre, pour vérifier qu'il échoue vraiment.
+- Tests pour chacun de ces points (URL trop longue, nom vide, compteurs hors bornes, 409/413, site reconnu, événements désactivés) et pour chacun des correctifs de sécurité : **303 vérifications**. Chaque test a été validé en réintroduisant le bug qu'il couvre, pour vérifier qu'il échoue vraiment.
 - Un test exécute réellement la mise à jour `0.4.2 → 0.5.0` sur une boutique existante (deux passes) : c'est l'opération la plus risquée pour un marchand, elle ne dépend pas d'une simple vérification de présence de fichier.
 
 ## [0.4.2] - 2026-10-05

@@ -687,10 +687,14 @@ test("une file non vide n'est jamais envoyée quand les événements sont étein
     $raw = core_requests()[0]['body'];
     check(strpos($raw, 'pending_events') === false, 'aucun pending_events dans le corps');
     check(strpos($raw, '4242') === false, 'aucun identifiant de commande transmis');
-    // ...et il repart à chaque nouvel envoi, tant que la file n'est pas vidée
-    core_replies(200);
-    priv($m, 'sendHeartbeat');
-    check(strpos(core_requests()[1]['body'], '4242') === false, 'toujours rien au deuxième envoi');
+    // ...et il repartirait à chaque nouvel envoi. On n'appelle PAS core_replies() ici : cette
+    // fonction purge le journal, et core_requests()[1] n'existerait pas — l'assertion passerait
+    // sans rien vérifier. Le statut 200 est déjà sur le disque, les requêtes s'accumulent.
+    check(priv($m, 'sendHeartbeat')['ok'], 'deuxième envoi accepté');
+    $reqs = core_requests();
+    same(count($reqs), 2, 'deux requêtes reçues par le faux SSM');
+    check(strpos($reqs[1]['body'], '4242') === false, 'toujours aucun identifiant au deuxième envoi');
+    same(count(json_decode((string) Configuration::get('SSM_PENDING_EVENTS'), true)), 1, 'file conservée pour un éventuel envoi ultérieur');
 });
 
 test("un message d'erreur distant ne peut pas injecter de balisage", function () {
@@ -705,6 +709,13 @@ test("un message d'erreur distant ne peut pas injecter de balisage", function ()
     check(strpos($hint, '<img') === false, 'pas de balise img');
     check(strpos($hint, 'onerror') === false, 'pas de gestionnaire d\'événement');
     check(strpos($hint, '422') !== false, 'le message reste utile');
+    // caractères de contrôle : un retour chariot isolé peut réécrire la ligne dans certains
+    // terminaux d'administration, et un octet non UTF-8 casse l'affichage de la page
+    $hint = $m->describeFailure(422, 0, json_encode(['detail' => [[
+        'loc' => ['body', 'x'], 'msg' => "champ\ninattendu\r\0",
+    ]]]));
+    check(strpos($hint, "\n") === false && strpos($hint, "\r") === false, 'pas de saut de ligne');
+    check(strpos($hint, "\0") === false, 'pas d\'octet nul');
 });
 
 test("un réglage absent est rapporté « non rapporté », pas « désactivé »", function () {
