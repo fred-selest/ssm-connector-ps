@@ -4,7 +4,7 @@
  *
  * @author  Selest Informatique
  * @license MIT
- * @version 0.5.0
+ * @version 0.6.0
  */
 
 if (!defined('_PS_VERSION_')) {
@@ -27,13 +27,22 @@ class Ssmconnector extends Module
     const MAX_COUNTER = 2000000000; // plafond des compteurs métier (app/schemas.py, SiteStats)
     const URL_MAX = 255;            // longueur maximale de shop_url acceptée par SSM Core
     const UPDATE_REPO = 'fred-selest/ssm-connector-ps';
+    const BACKUP_DIR = 'ssm-backups';     // sauvegardes des modules, à la racine de la boutique
+    const BACKUPS_KEPT = 3;               // combien de sauvegardes garder par module
+
+    /**
+     * Contrôle d'écriture du disque, remplaçable. `is_writable` est un builtin : sous root il
+     * renvoie toujours vrai, et les tests ne peuvent donc pas simuler un répertoire non
+     * inscriptible sans cette couture.
+     */
+    public static $disk_check = null;
     const UPDATE_TTL = 43200;
 
     public function __construct()
     {
         $this->name = 'ssmconnector';
         $this->tab = 'administration';
-        $this->version = '0.5.0';
+        $this->version = '0.6.0';
         $this->author = 'Selest Informatique';
         $this->need_instance = 0;
         $this->ps_versions_compliancy = ['min' => '8.0.0', 'max' => _PS_VERSION_];
@@ -549,6 +558,11 @@ class Ssmconnector extends Module
         if ($result['ok'] && isset($result['site_id'])) {
             Configuration::updateValue('SSM_SITE_ID', (int) $result['site_id']);
         }
+        // SSM ne touche pas à la boutique : il envoie une instruction, ce module l'exécute et
+        // renvoie ce qu'il a obtenu. C'est la seule source qui autorise SSM à écrire « appliquée ».
+        if ($result['ok'] && !empty($result['commands'])) {
+            $this->applyCommands($result['commands']);
+        }
         return $result;
     }
 
@@ -685,6 +699,8 @@ class Ssmconnector extends Module
             'connector_version' => $this->version,
             'latest_connector_version' => $this->cutOrNull($update['latest'], 20),
             'connector_update_available' => (bool) $update['available'],
+            // comptes rendus des commandes exécutées au heartbeat précédent
+            'results' => $this->takePendingResults(),
             // compteurs métier, lus par SSM Core depuis la 2.7.0
             'stats' => $stats,
             // informatifs (conservés, pas encore lus)
@@ -950,7 +966,292 @@ class Ssmconnector extends Module
             'http_code' => $http_code,
             'hint' => '',
             'site_id' => is_array($json) && isset($json['site_id']) ? (int) $json['site_id'] : null,
+            // Les instructions de mise à jour éventuelles : un connecteur plus ancien ne les lit pas,
+            // et une boutique portant une version antérieure reste parfaitement fonctionnelle.
+            'commands' => (is_array($json) && !empty($json['commands']) && is_array($json['commands']))
+                ? $json['commands'] : [],
         ];
+    }
+
+    // === Mises à jour demandées par SSM Core ===
+    //
+    // SSM n'a pas accès au système de fichiers de la boutique : il envoie une instruction, ce
+    // module l'exécute et renvoie ce qu'il a obtenu. C'est la seule source qui autorise SSM à
+    // écrire « appliquée » — un fait constaté ici, pas une intention là-bas.
+    //
+    // Ce chemin n'est atteint que si SSM l'a explicitement demandé : soit le prestataire a cliqué
+    // sur « Demander », soit la boutique est en politique automatique (le défaut est « manuel »).
+
+    /** Les comptes rendus en attente d'envoi. Ils partent UNE fois. */
+    public function takePendingResults()
+    {
+        $r = Configuration::get('SSM_UPDATE_RESULTS');
+        $r = is_string($r) ? json_decode($r, true) : $r;
+        if (!is_array($r)) {
+            return [];
+        }
+        Configuration::updateValue('SSM_UPDATE_RESULTS', '');   // partir, c'est les remettre
+        return array_slice($r, 0, 200);
+    }
+
+    public function queueResult($update_id, $status, $error = null, $version = null)
+    {
+        $r = Configuration::get('SSM_UPDATE_RESULTS');
+        $r = is_string($r) ? json_decode($r, true) : $r;
+        if (!is_array($r)) {
+            $r = [];
+        }
+        $entry = ['update_id' => (int) $update_id, 'status' => $status === 'success' ? 'success' : 'failed'];
+        if ($version !== null && $version !== '') {
+            $entry['version'] = $this->cutOrNull((string) $version, 50);
+        }
+        if ($error !== null && $error !== '') {
+            $entry['error'] = $this->cutOrNull((string) $error, 300);
+        }
+        $r[] = $entry;
+        // Borné : un module hors ligne des semaines ne doit pas accumuler des comptes rendus.
+        Configuration::updateValue('SSM_UPDATE_RESULTS', json_encode(array_slice($r, -200)));
+    }
+
+    /** Exécute les commandes reçues. Jamais de `\Throwable` non rattrapé : un module cassé ne doit
+     *  pas empêcher le heartbeat de partir. */
+    public function applyCommands($commands)
+    {
+        if (!is_array($commands)) {
+            return;
+        }
+        foreach ($commands as $cmd) {
+            if (!is_array($cmd) || !isset($cmd['id'])) {
+                continue;
+            }
+            try {
+                $this->applyCommand($cmd);
+            } catch (\Throwable $e) {
+                $this->queueResult($cmd['id'], 'failed', $e->getMessage());
+            }
+        }
+    }
+
+    private function applyCommand($cmd)
+    {
+        $id = (int) $cmd['id'];
+        $kind = isset($cmd['kind']) ? (string) $cmd['kind'] : '';
+        if ($kind !== 'update_extension') {
+            $this->queueResult($id, 'failed', 'Commande inconnue : ' . $kind);
+            return;
+        }
+        $slug = isset($cmd['slug']) ? (string) $cmd['slug'] : '';
+        // Le nom vient d'un tiers. Sans contrôle, « ../../app/config/… » désignerait un chemin
+        // hors du répertoire des modules.
+        if (!preg_match('/^[a-z0-9][a-z0-9._-]*$/i', $slug)) {
+            $this->queueResult($id, 'failed', 'Nom de module refusé : ' . $slug);
+            return;
+        }
+        $cible = isset($cmd['to_version']) ? (string) $cmd['to_version'] : '';
+        if ($cible === '') {
+            $this->queueResult($id, 'failed', 'Version cible absente de la commande.');
+            return;
+        }
+
+        $module = $this->findModule($slug);
+        if ($module === null) {
+            $this->queueResult($id, 'failed', 'Module « ' . $slug . ' » introuvable sur cette boutique.');
+            return;
+        }
+
+        $avant = $this->moduleVersion($slug);
+        if ($avant !== null && version_compare($avant, $cible, '>=')) {
+            // Déjà à jour, ou en deçà : rien à faire, et surtout rien à dégrader.
+            $this->queueResult($id, 'success', null, $avant);
+            return;
+        }
+
+        $backup = $this->backupModule($slug);
+        if ($backup === false) {
+            // Pas de sauvegarde, pas de mise à jour : sans elle, un échec se traduit par une
+            // boutique cassée, et SSM n'a aucun moyen de la remettre droit.
+            $this->queueResult($id, 'failed', 'Sauvegarde impossible, mise à jour annulée. Vérifiez les droits d\'écriture de ' . self::BACKUP_DIR . '/.');
+            return;
+        }
+
+        $erreur = $this->runModuleUpgrade($slug);
+        if ($erreur !== null) {
+            $remis = $this->restoreModule($slug, $backup);
+            $suffixe = $remis
+                ? ' — module remis à la version précédente.'
+                : ' — ET LA RESTAURATION AUTOMATIQUE A ÉCHOUÉ, intervention manuelle requise.';
+            $this->queueResult($id, 'failed', $erreur . $suffixe);
+            return;
+        }
+
+        $apres = $this->moduleVersion($slug);
+        if ($apres === null || version_compare($apres, $cible, '<')) {
+            $remis = $this->restoreModule($slug, $backup);
+            $suffixe = $remis
+                ? ' — module remis à la version précédente.'
+                : ' — ET LA RESTAURATION AUTOMATIQUE A ÉCHOUÉ, intervention manuelle requise.';
+            $this->queueResult($id, 'failed', 'Mise à jour annoncée vers ' . $cible . ' mais version installée : ' . ($apres ?: 'inconnue') . '.' . $suffixe);
+            return;
+        }
+        $this->queueResult($id, 'success', null, $apres);
+    }
+
+    private function modulePath($slug)
+    {
+        return _PS_MODULE_DIR_ . '/' . $slug;
+    }
+
+    private function findModule($slug)
+    {
+        if (!is_dir($this->modulePath($slug))) {
+            return null;
+        }
+        if (class_exists('Module') && method_exists('Module', 'getInstanceByName')) {
+            return Module::getInstanceByName($slug);
+        }
+        return null;
+    }
+
+    private function moduleVersion($slug)
+    {
+        $module = $this->findModule($slug);
+        if ($module !== null && isset($module->version)) {
+            return (string) $module->version;
+        }
+        $config = $this->modulePath($slug) . '/config.xml';
+        if (is_file($config) && function_exists('simplexml_load_file')) {
+            $xml = @simplexml_load_file($config);
+            if ($xml !== false && isset($xml->version)) {
+                return trim((string) $xml->version);
+            }
+        }
+        return null;
+    }
+
+    /** Copie le module avant toute modification. Retourne le chemin, ou false si la copie est impossible. */
+    private function backupModule($slug)
+    {
+        $source = $this->modulePath($slug);
+        if (!is_dir($source)) {
+            return false;
+        }
+        $base = _PS_ROOT_DIR_ . '/' . self::BACKUP_DIR;
+        if (!$this->diskWritable(_PS_MODULE_DIR_)) {
+            return false;
+        }
+        if (!is_dir($base) && !@mkdir($base, 0755, true) && !is_dir($base)) {
+            return false;
+        }
+        $dest = $base . '/' . $slug . '-' . gmdate('Ymd-His');
+        if (!$this->copyTree($source, $dest)) {
+            return false;
+        }
+        $this->pruneBackups($slug);
+        return $dest;
+    }
+
+    /** Ne garde que les BACKUPS_KEPT sauvegardes les plus récentes d'un module. */
+    private function pruneBackups($slug)
+    {
+        $base = _PS_ROOT_DIR_ . '/' . self::BACKUP_DIR;
+        $trouves = glob($base . '/' . $slug . '-*', GLOB_ONLYDIR);
+        if (!$trouves || count($trouves) <= self::BACKUPS_KEPT) {
+            return;
+        }
+        rsort($trouves);   // noms horodatés : l'ordre lexicographique est l'ordre chronologique
+        foreach (array_slice($trouves, self::BACKUPS_KEPT) as $vieux) {
+            $this->removeTree($vieux);
+        }
+    }
+
+    private function restoreModule($slug, $backup)
+    {
+        if (!$backup || !is_dir($backup)) {
+            return false;
+        }
+        $dest = $this->modulePath($slug);
+        $this->removeTree($dest);
+        return $this->copyTree($backup, $dest);
+    }
+
+    private function diskWritable($path)
+    {
+        if (self::$disk_check !== null) {
+            return (bool) call_user_func(self::$disk_check, $path);
+        }
+        return is_writable($path);
+    }
+
+    private function copyTree($from, $to)
+    {
+        if (!is_dir($to) && !@mkdir($to, 0755, true) && !is_dir($to)) {
+            return false;
+        }
+        $items = @scandir($from);
+        if ($items === false) {
+            return false;
+        }
+        foreach ($items as $item) {
+            if ($item === '.' || $item === '..') {
+                continue;
+            }
+            $src = $from . '/' . $item;
+            $dst = $to . '/' . $item;
+            if (is_dir($src)) {
+                if (!$this->copyTree($src, $dst)) {
+                    return false;
+                }
+            } elseif (!@copy($src, $dst)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private function removeTree($dir)
+    {
+        if (!is_dir($dir)) {
+            return;
+        }
+        $items = @scandir($dir);
+        if ($items !== false) {
+            foreach ($items as $item) {
+                if ($item === '.' || $item === '..') {
+                    continue;
+                }
+                $path = $dir . '/' . $item;
+                is_dir($path) ? $this->removeTree($path) : @unlink($path);
+            }
+        }
+        @rmdir($dir);
+    }
+
+    /**
+     * Lance la mise à jour PrestaShop. Retourne null si réussie, sinon la raison de l'échec.
+     *
+     * PrestaShop refuse d'écrire depuis une tâche cron sans droits : on vérifie donc le disque
+     * plutôt que de forcer, et on ne prétend avoir rien fait sinon.
+     */
+    private function runModuleUpgrade($slug)
+    {
+        if (!class_exists('Module')) {
+            return 'La couche.modules de PrestaShop est indisponible.';
+        }
+        $module = $this->findModule($slug);
+        if ($module === null) {
+            return 'Module introuvable au moment de la mise à jour.';
+        }
+        try {
+            if (method_exists($module, 'upgrade')) {
+                $module->upgrade();   // installe la version du module présent dans modules/
+            } else {
+                return 'Ce module ne sait pas se mettre à jour lui-même.';
+            }
+        } catch (\Throwable $e) {
+            return 'Erreur pendant la mise à jour : ' . $e->getMessage();
+        }
+        $module->clearCache();
+        return null;
     }
 
     /** Explique un échec d'envoi en langage clair, avec l'action à mener. Ne cite jamais le token. */
