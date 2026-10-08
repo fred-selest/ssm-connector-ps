@@ -2,6 +2,29 @@
 
 Format inspiré de [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/), versions sémantiques.
 
+## [0.7.0] - 2026-10-09
+
+### Ajouté
+- **Contrat 3 de SSM Core (2.13).** Le module annonce ce qu'il sait faire (`capabilities`) ; SSM ne
+  lui envoie rien d'autre. Un SSM plus ancien ignore les nouveaux champs.
+- **Activer et désactiver un module** à la demande de SSM (jamais le connecteur lui-même), avec un
+  compte rendu par action (`command_results`).
+- **Erreurs PHP** : erreurs fatales relevées en fin de requête, lecture incrémentale du journal de
+  PHP (`error_log`, 512 Ko au plus par envoi), chemins rendus relatifs à la boutique.
+- **Sauvegarde de la boutique** (`backup_site`) : base exportée en SQL et fichiers (sans caches ni
+  journaux, images en option) dans une archive zip déposée sur l'URL pré-signée fournie par SSM.
+
+### Corrigé
+- `upgrade-0.6.0.php` ne définissait pas `upgrade_module_0_6_0()`, la fonction que PrestaShop
+  appelle pour appliquer un script de mise à niveau.
+
+### Limite connue, désormais dite
+- **La mise à jour de modules ne fonctionne pas sur un vrai PrestaShop** : elle appelle
+  `$module->upgrade()`, qui n'existe pas dans la classe `Module` (seulement dans le faux module des
+  tests), et ne télécharge pas la nouvelle version. Elle échouait donc toujours, avec le message
+  « Ce module ne sait pas se mettre à jour lui-même ». `update_extension` n'est plus annoncé :
+  SSM n'envoie plus ces commandes. Reste à écrire : téléchargement depuis PrestaShop Addons.
+
 ## [0.6.0] - 2026-10-08
 
 ### Ajouté

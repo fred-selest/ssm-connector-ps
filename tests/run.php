@@ -867,5 +867,85 @@ test("mise a jour : les sauvegardes ne s'accumulent pas", function () {
         . count($garde) . ' conservées)');
 });
 
+// --- 0.7.0 : contrat 3 (capacités, actions, erreurs PHP, sauvegarde) ---
+
+test("contrat 3 : capacités annoncées, pas de connexion directe", function () {
+    $inv = priv(fresh(), 'collectInventory');
+    foreach (['plugin_activate', 'plugin_deactivate', 'php_errors'] as $c) {
+        check(in_array($c, $inv['capabilities'], true), "capacité $c");
+    }
+    check(!in_array('update_extension', $inv['capabilities'], true), "pas de mise à jour annoncée : Module::upgrade() n'existe pas dans PrestaShop");
+    same($inv['login_enabled'], false, 'pas de connexion directe pour PrestaShop');
+    same($inv['command_results'], [], 'aucun compte rendu au départ');
+});
+
+test("actions : désactiver puis réactiver un module, refus pour le connecteur et pour l'inconnu", function () {
+    $m = fresh();
+    $m->applyCommands([
+        ['id' => 1, 'ref' => 'command', 'kind' => 'plugin_deactivate', 'slug' => 'blockreassurance'],
+        ['id' => 2, 'ref' => 'command', 'kind' => 'plugin_activate', 'slug' => 'ps_legacy_demo'],
+        ['id' => 3, 'ref' => 'command', 'kind' => 'plugin_deactivate', 'slug' => 'ssmconnector'],
+        ['id' => 4, 'ref' => 'command', 'kind' => 'plugin_deactivate', 'slug' => '../x'],
+        ['id' => 5, 'ref' => 'command', 'kind' => 'plugin_install', 'slug' => 'x'],
+    ]);
+    $r = $m->takeCommandResults();
+    same(array_column($r, 'status'), ['success', 'success', 'failed', 'failed', 'failed'], 'statuts');
+    same(Module::$by_name['blockreassurance']->active, false, 'module désactivé');
+    same(priv($m, 'takePendingResults'), [], "aucun compte rendu pris pour une mise à jour");
+});
+
+test("erreurs PHP : journal lu par morceaux, chemins relatifs", function () {
+    $m = fresh();
+    $log = _PS_ROOT_DIR_ . '/php.log';
+    file_put_contents($log, "[08-Oct-2026 10:00:00 UTC] PHP Fatal error:  Uncaught Error: x() in " . _PS_ROOT_DIR_ . "modules/a/a.php:9\nStack trace:\n");
+    ini_set('error_log', $log);
+    Configuration::updateValue('SSM_LOG_OFFSET', 0);
+    $e = $m->takePhpErrors();
+    same([$e[0]['level'], $e[0]['message'], $e[0]['file'], $e[0]['line']], ['fatal', 'Uncaught Error: x()', 'modules/a/a.php', 9], 'erreur lue');
+    same($m->takePhpErrors(), [], 'rien de neuf ensuite');
+    ini_restore('error_log');
+});
+
+test("sauvegarde : base et fichiers dans l'archive, caches exclus, dossier de travail nettoyé", function () {
+    $m = fresh();
+    @mkdir(_PS_ROOT_DIR_ . '/var/cache/prod', 0755, true);
+    file_put_contents(_PS_ROOT_DIR_ . '/var/cache/prod/x.php', 'cache');
+    @mkdir(_PS_ROOT_DIR_ . '/img/p', 0755, true);
+    file_put_contents(_PS_ROOT_DIR_ . '/img/p/1.jpg', 'jpeg');
+    $vu = [];
+    SsmConnector::$uploader = function ($url, $path, $size) use (&$vu) {
+        $z = new ZipArchive();
+        $z->open($path);
+        for ($i = 0; $i < $z->numFiles; $i++) {
+            $vu['names'][] = $z->getNameIndex($i);
+        }
+        $vu['sql'] = $z->getFromName('database.sql');
+        $z->close();
+        return ['ok' => true, 'error' => null];
+    };
+    $m->applyCommands([['id' => 9, 'ref' => 'command', 'kind' => 'backup_site',
+        'params' => ['upload_url' => 'https://s3.example/k.zip?sig=x', 'include_uploads' => false]]]);
+    $r = $m->takeCommandResults()[0];
+    same($r['status'], 'success', 'sauvegarde réussie');
+    same($r['data']['tables'], 2, 'deux tables');
+    check(in_array('boutique/modules/blockreassurance/config.xml', $vu['names'], true), 'fichiers de la boutique');
+    check(!in_array('boutique/var/cache/prod/x.php', $vu['names'], true), 'cache exclu');
+    check(!in_array('boutique/img/p/1.jpg', $vu['names'], true), 'images exclues sur demande');
+    check(strpos($vu['sql'], "'o\\'brien@exemple.fr'") !== false && strpos($vu['sql'], 'NULL') !== false, 'SQL échappé');
+    check(!is_dir(_PS_ROOT_DIR_ . '/' . SsmConnector::BACKUP_TMP), 'dossier de travail supprimé');
+    SsmConnector::$uploader = function () { return ['ok' => false, 'error' => 'HTTP 403']; };
+    $m->applyCommands([['id' => 10, 'ref' => 'command', 'kind' => 'backup_site', 'params' => ['upload_url' => 'https://s3.example/k.zip']]]);
+    same($m->takeCommandResults()[0]['status'], 'failed', 'dépôt refusé = échec');
+    SsmConnector::$uploader = null;
+});
+
+test("script de mise à niveau 0.6.0 et 0.7.0 : fonctions appelées par PrestaShop", function () {
+    require_once dirname(__DIR__) . '/upgrade/upgrade-0.6.0.php';
+    require_once dirname(__DIR__) . '/upgrade/upgrade-0.7.0.php';
+    $m = fresh();
+    check(function_exists('upgrade_module_0_6_0') && upgrade_module_0_6_0($m), 'upgrade_module_0_6_0');
+    check(function_exists('upgrade_module_0_7_0') && upgrade_module_0_7_0($m), 'upgrade_module_0_7_0');
+});
+
 echo "\n$checks vérifications, $failures échec(s)\n";
 exit($failures === 0 ? 0 : 1);

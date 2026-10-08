@@ -2,8 +2,8 @@
 <module>
     <name>ssmconnector</name>
     <displayName><![CDATA[SSM Connector]]></displayName>
-    <version><![CDATA[0.6.0]]></version>
-    <description><![CDATA[Connecteur SSM (Selest Site Manager) — inventaire envoyé à SSM Core, sans rien modifier sur la boutique.]]></description>
+    <version><![CDATA[0.7.0]]></version>
+    <description><![CDATA[Connecteur SSM (Selest Site Manager) — inventaire envoyé à SSM Core, actions demandées par SSM exécutées et rapportées.]]></description>
     <author><![CDATA[Selest Informatique]]></author>
     <tab><![CDATA[administration]]></tab>
     <confirmUninstall>Are you sure you want to uninstall SSM Connector?</confirmUninstall>

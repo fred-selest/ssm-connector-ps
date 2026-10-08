@@ -23,7 +23,20 @@ class Db
     public static $counts = null;   // valeurs renvoyées par getValue(), dans l'ordre des COUNT(*) testés
     private $count_index = 0;
     public static function getInstance() { return new self(); }
-    public function executeS($sql) { return self::$modules; }
+    public function executeS($sql)
+    {
+        if (stripos($sql, 'SHOW TABLES') === 0) {
+            return [['Tables_in_ps' => 'ps_module'], ['Tables_in_ps' => 'ps_customer']];
+        }
+        if (stripos($sql, 'SHOW CREATE TABLE') === 0) {
+            preg_match('/`([^`]+)`/', $sql, $m);
+            return [['Table' => $m[1], 'Create Table' => 'CREATE TABLE `' . $m[1] . '` (id int)']];
+        }
+        if (stripos($sql, 'SELECT * FROM `') === 0) {
+            return strpos($sql, 'LIMIT 0,') !== false ? [['id' => 1, 'email' => "o'brien@exemple.fr"], ['id' => 2, 'email' => null]] : [];
+        }
+        return self::$modules;
+    }
     public function getValue($sql)
     {
         if (self::$counts === null) {
@@ -84,6 +97,9 @@ class Module
         return true;
     }
     public function clearCache() {}
+    public $active = true;
+    public function enable($force_all = false) { $this->active = true; return true; }
+    public function disable($force_all = false) { $this->active = false; return true; }
     public function __construct()
     {
         $this->context = new stdClass();
