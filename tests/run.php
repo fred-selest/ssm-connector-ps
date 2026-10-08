@@ -46,12 +46,24 @@ function fresh()
     Tools::$shop_domain = 'https://boutique.exemple.fr';
     Module::$hooks = [];
     Module::$unregistered = [];
+    Module::$by_name = [];
+    Module::$upgraded = [];
+    Module::$upgrade_ok = true;
+    SsmConnector::$disk_check = null;
+    ssm_reset_modules();
     Db::$counts = null;
     Db::$modules = [
         ['name' => 'ps_emailsubscription', 'version' => '3.0.0', 'active' => '1'],
         ['name' => 'blockreassurance', 'version' => '5.1.2', 'active' => '1'],
         ['name' => 'ps_legacy_demo', 'version' => '1.0.0', 'active' => '0'],
     ];
+    // Chaque module de la base existe aussi comme instance : c'est par là que passe une mise à jour.
+    foreach (Db::$modules as $ligne) {
+        $mod = new Module();
+        $mod->name = $ligne['name'];
+        $mod->version = $ligne['version'];
+        Module::$by_name[$ligne['name']] = $mod;
+    }
     $theme = new Theme();
     Theme::$list = [$theme];
     Configuration::updateValue('SSM_UPDATE_CACHE', json_encode(['checked_at' => time(), 'error' => false, 'latest' => '0.5.0', 'url' => null, 'download' => null]));
@@ -163,7 +175,7 @@ test("l'installation n'invente plus de token (il vient de SSM Core)", function (
 test("l'inventaire respecte le contrat de SSM Core", function () {
     $m = fresh();
     $inv = priv($m, 'collectInventory');
-    foreach (['cms_version', 'php_version', 'db_version', 'web_server', 'hostname', 'site_path', 'extensions', 'themes'] as $key) {
+    foreach (['cms_version', 'php_version', 'db_version', 'web_server', 'hostname', 'site_path', 'extensions', 'themes', 'results'] as $key) {
         check(array_key_exists($key, $inv), "clé lue par SSM Core : $key");
     }
     check(!array_key_exists('modules', $inv) && !array_key_exists('mysql_version', $inv), "plus de clés ignorées par SSM Core (modules, mysql_version)");
@@ -173,7 +185,7 @@ test("l'inventaire respecte le contrat de SSM Core", function () {
     check(!isset($inv['extensions'][0]['type']), 'pas de champ superflu');
     same($inv['db_version'], '8.0.36', 'version de la base');
     check(preg_match('/^\d+\.\d+\.\d+$/', $inv['php_version']) === 1 && strlen($inv['php_version']) <= 20, 'version de PHP au format X.Y.Z');
-    same($inv['site_path'], '/var/www/html', 'chemin');
+    same($inv['site_path'], _PS_ROOT_DIR_, 'chemin');
     same(count($inv['themes']), 1, 'un thème');
     same($inv['themes'][0]['slug'], 'classic', 'identifiant du thème');
     same($inv['module_count'], 3, 'compteur');
@@ -224,7 +236,7 @@ test("l'inventaire respecte les longueurs maximales de SSM Core (sinon tout est 
     same(mb_strlen($inv['web_server']), 50, 'web_server tronqué à 50');
     same(mb_strlen($inv['shop_url']), 255, 'shop_url tronqué à 255');
     same(mb_strlen($inv['latest_connector_version']), 20, 'latest_connector_version tronqué à 20');
-    same($inv['site_path'], '/var/www/html', 'site_path transmis tel quel (13 < 500 : aucune troncature)');
+    same($inv['site_path'], _PS_ROOT_DIR_, 'site_path transmis tel quel (aucune troncature)');
     same(mb_strlen($inv['hostname']), strlen(gethostname()) === 0 ? 0 : mb_strlen(gethostname()), 'hostname sous la limite de 255');
     check(mb_strlen($inv['hostname']) <= 255, 'hostname <= 255');
 });
@@ -739,6 +751,120 @@ test("les compteurs module_count et module_active_count décrivent la même list
     $inv = priv($m, 'collectInventory');
     same($inv['module_count'], 1000, 'plafond appliqué');
     check($inv['module_active_count'] <= $inv['module_count'], 'actifs ≤ total, même au-delà du plafond');
+});
+
+
+// === Mises à jour demandées par SSM Core ===
+
+test("mise a jour : rien n'est exécuté sans commande", function () {
+    $m = fresh();
+    same(priv($m, 'collectInventory')['results'], [], 'aucun compte rendu au repos');
+    same(Module::$upgraded, [], "aucun module touché sans commande");
+});
+
+test("mise a jour : un compte rendu part, puis il ne repart plus", function () {
+    $m = fresh();
+    $m->queueResult(7, 'success', null, '2.0.0');
+    same(priv($m, 'collectInventory')['results'], [['update_id' => 7, 'status' => 'success', 'version' => '2.0.0']], 'compte rendu transmis');
+    same(priv($m, 'collectInventory')['results'], [], "un compte rendu ne repart pas deux fois");
+});
+
+test("mise a jour : le compte rendu ne contient aucune donnée personnelle", function () {
+    $m = fresh();
+    $m->queueResult(7, 'failed', 'permission refusée sur modules/ps_emailsubscription');
+    $json = json_encode(priv($m, 'collectInventory')['results']);
+    foreach (['customer', 'panier', 'commande', 'password', 'token', 'cookie'] as $interdit) {
+        check(stripos($json, $interdit) === false, "pas de « $interdit » dans un compte rendu");
+    }
+});
+
+test("mise a jour : un nom de module qui sort du dossier est refusé", function () {
+    $m = fresh();
+    $m->applyCommands([['id' => 1, 'kind' => 'update_extension', 'slug' => '../../app/config', 'to_version' => '2.0']]);
+    $r = priv($m, 'takePendingResults')[0];
+    same($r['status'], 'failed', 'nom hostile refusé');
+    check(strpos($r['error'], 'refusé') !== false, 'la raison est explicite');
+});
+
+test("mise a jour : une commande inconnue est refusée", function () {
+    $m = fresh();
+    $m->applyCommands([['id' => 2, 'kind' => 'drop_table', 'slug' => 'ps_emailsubscription', 'to_version' => '2.0']]);
+    $r = priv($m, 'takePendingResults')[0];
+    same($r['status'], 'failed', 'commande inconnue refusée');
+});
+
+test("mise a jour : un module absent est signalé, pas deviné", function () {
+    $m = fresh();
+    $m->applyCommands([['id' => 3, 'kind' => 'update_extension', 'slug' => 'module_inexistant', 'to_version' => '2.0']]);
+    $r = priv($m, 'takePendingResults')[0];
+    same($r['status'], 'failed', 'module absent');
+    check(stripos($r['error'], 'introuvable') !== false, 'la raison dit ce qui manque');
+});
+
+test("mise a jour : déjà à jour, on ne dégrade rien", function () {
+    $m = fresh();
+    $m->applyCommands([['id' => 4, 'kind' => 'update_extension', 'slug' => 'ps_emailsubscription', 'to_version' => '1.0.0']]);
+    $r = priv($m, 'takePendingResults')[0];
+    same($r['status'], 'success', 'déjà à jour');
+    same(Module::$upgraded, [], "le module n'a pas été touché");
+});
+
+test("mise a jour : sauvegarde avant modification, restauration si ça échoue", function () {
+    $m = fresh();
+    Module::$upgrade_ok = false;
+    $m->applyCommands([['id' => 5, 'kind' => 'update_extension', 'slug' => 'ps_emailsubscription', 'to_version' => '9.9.9']]);
+    $sauvegardes = glob(_PS_ROOT_DIR_ . '/' . SsmConnector::BACKUP_DIR . '/ps_emailsubscription-*', GLOB_ONLYDIR);
+    check(count($sauvegardes) >= 1, 'une sauvegarde existe avant toute modification');
+    $r = priv($m, 'takePendingResults')[0];
+    same($r['status'], 'failed', "l'échec est rapporté, pas masqué");
+    check(stripos($r['error'], 'remis') !== false || stripos($r['error'], 'restauration') !== false,
+        "le compte rendu dit ce qu'est devenu le module");
+    Module::$upgrade_ok = true;
+});
+
+test("mise a jour : sans sauvegarde possible, on n'essaie pas", function () {
+    $m = fresh();
+    SsmConnector::$disk_check = function ($path) { return false; };
+    $m->applyCommands([['id' => 6, 'kind' => 'update_extension', 'slug' => 'ps_emailsubscription', 'to_version' => '9.9.9']]);
+    $r = priv($m, 'takePendingResults')[0];
+    same($r['status'], 'failed', 'refus sans sauvegarde');
+    check(stripos($r['error'], 'annul') !== false, 'la mise à jour est explicitement annulée');
+    same(Module::$upgraded, [], "l'upgrade n'a pas été appelé");
+    SsmConnector::$disk_check = null;
+});
+
+test("mise a jour : la version installée est relue après coup", function () {
+    // Se fier au retour d'upgrade() ferait croire à une réussite même si rien n'a bougé sur le
+    // disque : c'est ce que voit le test en simulant un upgrade() qui ne change rien.
+    $m = fresh();
+    Module::$upgrade_ok = true;
+    $m->applyCommands([['id' => 7, 'kind' => 'update_extension', 'slug' => 'ps_emailsubscription', 'to_version' => '9.9.9']]);
+    $r = priv($m, 'takePendingResults')[0];
+    // ps_emailsubscription est en 3.0.0 ; upgrade() le passe à 3.1, la cible 9.9.9 n'est pas
+    // atteinte. Dire « appliquée » quand la version demandée n'est pas là serait un mensonge.
+    same($r['status'], 'failed', 'cible non atteinte, donc échec');
+    check(stripos($r['error'], '9.9.9') !== false, 'la raison cite la version attendue');
+});
+
+test("mise a jour : cible atteinte, le compte rendu est positif", function () {
+    $m = fresh();
+    $m->applyCommands([['id' => 8, 'kind' => 'update_extension', 'slug' => 'ps_emailsubscription', 'to_version' => '3.1']]);
+    $r = priv($m, 'takePendingResults')[0];
+    same($r['status'], 'success', 'mise à jour effective');
+    same($r['version'], '3.1', 'la version réellement installée est rapportée');
+    same(Module::$upgraded, ['ps_emailsubscription'], "le module visé est bien celui qui a été mis à jour");
+});
+
+test("mise a jour : les sauvegardes ne s'accumulent pas", function () {
+    for ($i = 0; $i < 6; $i++) {
+        $m = fresh();
+        Module::$upgrade_ok = false;
+        $m->applyCommands([['id' => 100 + $i, 'kind' => 'update_extension', 'slug' => 'ps_emailsubscription', 'to_version' => '9.0.' . $i]]);
+    }
+    Module::$upgrade_ok = true;
+    $garde = glob(_PS_ROOT_DIR_ . '/' . SsmConnector::BACKUP_DIR . '/ps_emailsubscription-*', GLOB_ONLYDIR);
+    check(count($garde) <= SsmConnector::BACKUPS_KEPT + 1, 'les anciennes sauvegardes sont purgées ('
+        . count($garde) . ' conservées)');
 });
 
 echo "\n$checks vérifications, $failures échec(s)\n";

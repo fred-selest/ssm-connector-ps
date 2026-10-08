@@ -2,6 +2,25 @@
 
 Format inspiré de [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/), versions sémantiques.
 
+## [0.6.0] - 2026-10-08
+
+### Ajouté
+- **Exécution des mises à jour de modules demandées par SSM Core.** SSM Core n'a pas accès au
+  système de fichiers d'une boutique : il envoie une instruction dans la réponse du heartbeat, ce
+  module l'exécute, et renvoie le compte rendu au heartbeat suivant. C'est la seule chose qui
+  autorise SSM à écrire « appliquée » — et la seule source honnête de ce fait.
+- **Une sauvegarde avant chaque modification**, dans `ssm-backups/` à la racine de la boutique,
+  avec trois générations conservées par module. En cas d'échec, le dossier est restauré et le
+  compte rendu dit explicitement ce qu'est devenu le module.
+- **Rien n'est exécuté sans demande.** Après coup, la version installée est relue : une commande
+  annoncée comme faite sans que la version ait bougé est rapportée en échec.
+
+### Sécurité
+- Le nom de module venu de SSM est contrôlé avant tout usage : un identifiant contenant `../` ne
+  peut plus désigner un chemin hors du répertoire des modules.
+- Les comptes rendus n'emportent que l'identifiant de mise à jour, l'état, la version et la
+  raison. Aucune donnée personnelle de la boutique.
+
 ## [0.5.0]
 
 Aligné sur SSM Core 2.7.0, qui lit enfin l'état de la boutique et les compteurs que le module envoyait déjà. Trois défauts d'alignement corrigés au passage.

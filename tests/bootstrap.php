@@ -5,7 +5,8 @@
 define('_PS_VERSION_', '8.1.5');
 define('_DB_PREFIX_', 'ps_');
 define('_PS_MODE_DEV_', false);
-define('_PS_ROOT_DIR_', '/var/www/html');
+define('_PS_ROOT_DIR_', sys_get_temp_dir() . '/ssm-fake-ps/');
+define('_PS_MODULE_DIR_', _PS_ROOT_DIR_ . '/modules');
 define('_COOKIE_KEY_', 'cle-de-test');
 
 class Configuration
@@ -66,6 +67,23 @@ class Module
     public $displayName; public $description; public $context;
     public static $hooks = [];          // crochets attachés
     public static $unregistered = [];   // crochets détachés
+    public static $by_name = [];        // modules instanciés, par nom
+    public static $upgraded = [];       // modules dont upgrade() a été appelé
+    public static $upgrade_ok = true;   // upgrade() réussit-il ?
+    public static function getInstanceByName($name)
+    {
+        return isset(self::$by_name[$name]) ? self::$by_name[$name] : null;
+    }
+    public function upgrade()
+    {
+        self::$upgraded[] = $this->name;
+        if (!self::$upgrade_ok) {
+            throw new RuntimeException('échec simulé de mise à jour du module.');
+        }
+        $this->version = (string) (floatval($this->version) + 0.1);
+        return true;
+    }
+    public function clearCache() {}
     public function __construct()
     {
         $this->context = new stdClass();
@@ -84,3 +102,35 @@ class Module
 }
 
 require dirname(__DIR__) . '/ssmconnector.php';
+
+/**
+ * (Re)crée un arbre de modules minimal sur le disque : la sauvegarde et la restauration ont de
+ * vrais dossiers à copier. Le contenu importe peu ; le fait qu'un dossier existe, beaucoup.
+ */
+function ssm_reset_modules()
+{
+    ssm_rmtree(_PS_ROOT_DIR_);
+    mkdir(_PS_MODULE_DIR_, 0755, true);
+    mkdir(_PS_ROOT_DIR_ . '/' . SsmConnector::BACKUP_DIR, 0755, true);
+    foreach (['ps_emailsubscription', 'blockreassurance', 'ps_legacy_demo'] as $slug) {
+        mkdir(_PS_MODULE_DIR_ . '/' . $slug, 0755, true);
+        file_put_contents(_PS_MODULE_DIR_ . '/' . $slug . '/' . $slug . '.php', "<?php\n");
+        file_put_contents(_PS_MODULE_DIR_ . '/' . $slug . '/config.xml',
+            "<?xml version=\"1.0\"?><module><version>1.0.0</version></module>\n");
+    }
+}
+
+function ssm_rmtree($dir)
+{
+    if (!is_dir($dir)) {
+        return;
+    }
+    foreach (scandir($dir) as $item) {
+        if ($item === '.' || $item === '..') {
+            continue;
+        }
+        $path = $dir . '/' . $item;
+        is_dir($path) ? ssm_rmtree($path) : @unlink($path);
+    }
+    @rmdir($dir);
+}
