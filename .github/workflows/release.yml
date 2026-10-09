@@ -52,11 +52,17 @@ jobs:
 
       - uses: actions/checkout@v4
 
+      - uses: shivammathur/setup-php@v2   # sans Docker Hub (limite de téléchargement anonyme)
+        with:
+          php-version: '8.1'
+          extensions: zip
+          coverage: none
+
       - name: Lint PHP
         run: find . -name '*.php' -not -path './.git/*' -print0 | xargs -0 -n1 php -l
 
       - name: Tests (PHP 8.1, la version minimale annoncée)
-        run: docker run --rm -v "$PWD":/app -w /app php:8.1-cli php tests/run.php 2>/dev/null
+        run: php tests/run.php 2>/dev/null
 
       - name: Vérifier que le tag correspond à la version du module
         run: |

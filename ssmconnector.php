@@ -4,7 +4,7 @@
  *
  * @author  Selest Informatique
  * @license MIT
- * @version 0.8.0
+ * @version 0.8.1
  */
 
 if (!defined('_PS_VERSION_')) {
@@ -53,7 +53,7 @@ class Ssmconnector extends Module
     {
         $this->name = 'ssmconnector';
         $this->tab = 'administration';
-        $this->version = '0.8.0';
+        $this->version = '0.8.1';
         $this->author = 'Selest Informatique';
         $this->need_instance = 0;
         $this->ps_versions_compliancy = ['min' => '8.0.0', 'max' => _PS_VERSION_];
@@ -468,9 +468,42 @@ class Ssmconnector extends Module
             // Refermée : la clé et les liens déjà signés cessent de servir tout de suite.
             Configuration::deleteByName('SSM_LOGIN_KEY');
             Configuration::deleteByName('SSM_LOGIN_NONCES');
+            $this->sendHeartbeat();   // SSM l'apprend tout de suite et ne propose plus le lien
             return $this->displayConfirmation($this->l('Connexion directe fermée.'));
         }
-        return $this->displayConfirmation($this->l('Connexion directe ouverte : prête après deux envois à SSM (clé remise, puis confirmée).'));
+        return $this->syncLoginNow();
+    }
+
+    /**
+     * Ouverture : deux envois tout de suite au lieu d'attendre deux envois planifiés (jusqu'à deux heures). Le
+     * premier reçoit la clé de SSM, le second annonce son empreinte : SSM confirme, la connexion directe est prête.
+     */
+    public function syncLoginNow()
+    {
+        $later = $this->l('Connexion directe ouverte. SSM n\'a pas répondu : elle sera prête après deux envois (ou deux clics sur « Tester maintenant »).');
+        if (!$this->sendHeartbeat()['ok']) {
+            return $this->displayConfirmation($later);
+        }
+        if (!$this->loginKey()) {
+            return $this->displayConfirmation($this->l('Connexion directe ouverte, mais SSM n\'a pas remis de clé : SSM 2.14.3 ou plus récent est nécessaire.'));
+        }
+        if (!$this->sendHeartbeat()['ok']) {
+            return $this->displayConfirmation($later);
+        }
+        return $this->displayConfirmation($this->l('Connexion directe ouverte et prête : SSM peut ouvrir une session sur cette boutique.'));
+    }
+
+    /** Après une mise à jour du module : SSM reçoit la nouvelle version tout de suite (jamais bloquant). */
+    public function announceNewVersion()
+    {
+        try {
+            if (Configuration::get('SSM_SSM_URL') && Configuration::get('SSM_CONNECTOR_TOKEN')) {
+                $this->sendHeartbeat(5);
+            }
+        } catch (\Throwable $e) {
+            // une mise à jour du module ne doit jamais échouer pour un envoi manqué : l'envoi planifié suivra
+        }
+        return true;
     }
 
     private function renderLoginPanel($nonce)
@@ -1495,12 +1528,16 @@ class Ssmconnector extends Module
         if ($offset < 0 || $offset > $size) {
             $offset = max(0, $size - self::LOG_READ_MAX);
         }
+        if ($size <= $offset) {
+            // Rien de neuf : fread(…, 0) lève une ValueError en PHP 8 (rattrapée, mais le fichier restait ouvert).
+            return;
+        }
         $fh = @fopen($path, 'rb');
         if (!$fh) {
             return;
         }
         fseek($fh, $offset);
-        $chunk = (string) fread($fh, min(self::LOG_READ_MAX, max(0, $size - $offset)));
+        $chunk = (string) fread($fh, min(self::LOG_READ_MAX, $size - $offset));
         fclose($fh);
         $end = strrpos($chunk, "\n");
         if ($end === false) {

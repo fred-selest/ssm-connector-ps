@@ -905,6 +905,9 @@ test("erreurs PHP : journal lu par morceaux, chemins relatifs", function () {
     $e = $m->takePhpErrors();
     same([$e[0]['level'], $e[0]['message'], $e[0]['file'], $e[0]['line']], ['fatal', 'Uncaught Error: x()', 'modules/a/a.php', 9], 'erreur lue');
     same($m->takePhpErrors(), [], 'rien de neuf ensuite');
+    $before = file_get_contents($log);
+    $m->takePhpErrors();
+    same(file_get_contents($log), $before, "rien de neuf : rien n'est écrit dans le journal (plus de fread de 0 octet)");
     ini_restore('error_log');
 });
 
@@ -1090,6 +1093,43 @@ test("connexion directe : case à cocher de la page du module, réservée au sup
     $m->getContent();
     same(SsmConnector::loginAllowed(), false, 'jeton anti-CSRF exigé');
     Tools::$submitted = [];
+});
+
+test("connexion directe : prête dès l'enregistrement, sans attendre deux envois planifiés", function () {
+    $m = fresh();
+    configure($m);
+    // le faux SSM remet une clé à chaque envoi ; le module l'enregistre et annonce son empreinte au second
+    core_replies(200, ['site_id' => 42, 'status' => 'accepted', 'commands' => [], 'login_key' => 'cle-de-ssm']);
+    Tools::$submitted = ['submitSSMLogin'];
+    Tools::$values = ['ssm_nonce' => priv($m, 'nonce'), 'SSM_LOGIN_ALLOWED' => '1', 'SSM_LOGIN_EMPLOYEE' => '15'];
+    $out = $m->getContent();
+    $sent = core_requests();
+    same(count($sent), 2, 'deux envois tout de suite');
+    $second = json_decode($sent[1]['body'], true);
+    same($second['login_key_fingerprint'], substr(hash('sha256', 'cle-de-ssm'), 0, 16), 'le second annonce la clé reçue au premier');
+    check(strpos($out, 'ouverte et prête') !== false, 'le message dit qu\'elle est prête');
+
+    core_replies(500, '');
+    Tools::$values = ['ssm_nonce' => priv($m, 'nonce'), 'SSM_LOGIN_ALLOWED' => '1', 'SSM_LOGIN_EMPLOYEE' => '15'];
+    check(strpos($m->getContent(), 'SSM n\'a pas répondu') !== false, 'SSM muet : le message le dit');
+
+    core_replies(200, []);
+    Tools::$values = ['ssm_nonce' => priv($m, 'nonce'), 'SSM_LOGIN_EMPLOYEE' => '0'];
+    $m->getContent();
+    same(count(core_requests()), 1, 'refermée : SSM prévenu aussitôt');
+    Tools::$submitted = [];
+});
+
+test("script de mise à niveau 0.8.1 : nouvelle version annoncée, jamais bloquant", function () {
+    require_once dirname(__DIR__) . '/upgrade/upgrade-0.8.1.php';
+    $m = fresh();
+    core_replies(200, []);
+    check(upgrade_module_0_8_1($m), 'sans configuration : réussit sans rien envoyer');
+    same(count(core_requests()), 0, 'rien envoyé');
+    configure($m);
+    core_replies(500, '');
+    check(upgrade_module_0_8_1($m), 'SSM en erreur : la mise à jour réussit quand même');
+    same(count(core_requests()), 1, 'un envoi tenté');
 });
 
 test("script de mise à niveau 0.8.0", function () {
