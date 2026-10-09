@@ -8,6 +8,8 @@ define('_PS_MODE_DEV_', false);
 define('_PS_ROOT_DIR_', sys_get_temp_dir() . '/ssm-fake-ps/');
 define('_PS_MODULE_DIR_', _PS_ROOT_DIR_ . '/modules');
 define('_COOKIE_KEY_', 'cle-de-test');
+define('__PS_BASE_URI__', '/');
+define('_PS_ADMIN_PROFILE_', 1);
 
 class Configuration
 {
@@ -20,11 +22,16 @@ class Configuration
 class Db
 {
     public static $modules = [];
+    public static $employees = [['id_employee' => 12, 'firstname' => 'Ada', 'lastname' => 'Admin', 'email' => 'admin@boutique.fr'],
+                                ['id_employee' => 15, 'firstname' => 'Bob', 'lastname' => 'Vendeur', 'email' => 'bob@boutique.fr']];
     public static $counts = null;   // valeurs renvoyées par getValue(), dans l'ordre des COUNT(*) testés
     private $count_index = 0;
     public static function getInstance() { return new self(); }
     public function executeS($sql)
     {
+        if (stripos($sql, 'FROM ps_employee') !== false) {
+            return self::$employees;
+        }
         if (stripos($sql, 'SHOW TABLES') === 0) {
             return [['Tables_in_ps' => 'ps_module'], ['Tables_in_ps' => 'ps_customer']];
         }
@@ -61,6 +68,49 @@ class Tools
     public static function getValue($k) { return isset(self::$values[$k]) ? self::$values[$k] : null; }
     public static function isSubmit($k) { return in_array($k, self::$submitted, true); }
     public static function getRemoteAddr() { return '203.0.113.9'; }
+    public static function getShopDomainSsl($http = false) { return self::$shop_domain; }
+    public static function getAdminToken($s) { return md5('jeton|' . $s); }
+}
+
+class Validate
+{
+    public static function isEmail($e) { return (bool) filter_var($e, FILTER_VALIDATE_EMAIL); }
+    public static function isLoadedObject($o) { return is_object($o) && !empty($o->id); }
+}
+
+class Tab { public static function getIdFromClassName($c) { return 1; } }
+
+/** Employés de la fausse boutique : id => [email, actif]. Db::getValue() renvoie l'identifiant demandé par les tests. */
+class Employee
+{
+    public static $rows = [12 => ['admin@boutique.fr', 1], 15 => ['bob@boutique.fr', 1], 16 => ['parti@boutique.fr', 0]];
+    public $id; public $email; public $active; public $id_profile = 1; public $passwd = 'hash'; public $remote_addr;
+    public function __construct($id = null)
+    {
+        if ($id !== null && isset(self::$rows[$id])) {
+            $this->id = $id;
+            list($this->email, $this->active) = self::$rows[$id];
+        }
+    }
+    public function getByEmail($email)
+    {
+        foreach (self::$rows as $id => $r) {
+            if ($r[0] === $email && $r[1]) {
+                $this->__construct($id);
+                return $this;
+            }
+        }
+        return false;
+    }
+}
+
+/** Cookie du back-office : les tests lisent ce qui a été écrit. */
+class Cookie
+{
+    public static $written = [];
+    public $args;
+    public function __construct(...$args) { $this->args = $args; }
+    public function write() { self::$written[] = ['args' => $this->args, 'values' => get_object_vars($this)]; }
 }
 
 class Theme
@@ -72,7 +122,7 @@ class Theme
     public function getVersion() { return '1.7.2'; }
 }
 
-class FakeLink { public function getModuleLink($module, $controller) { return 'https://boutique.exemple.fr/module/' . $module . '/' . $controller; } }
+class FakeLink { public function getModuleLink($module, $controller, $params = [], $ssl = null) { return 'https://boutique.exemple.fr/module/' . $module . '/' . $controller; } }
 
 class Module
 {
@@ -104,7 +154,7 @@ class Module
     {
         $this->context = new stdClass();
         $this->context->shop = (object) ['theme_name' => 'classic'];
-        $this->context->employee = (object) ['id' => 7];
+        $this->context->employee = (object) ['id' => 7, 'id_profile' => 1];   // super-administrateur
         $this->context->link = new FakeLink();
     }
     public function l($s) { return $s; }

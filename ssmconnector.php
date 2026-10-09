@@ -4,7 +4,7 @@
  *
  * @author  Selest Informatique
  * @license MIT
- * @version 0.7.0
+ * @version 0.8.0
  */
 
 if (!defined('_PS_VERSION_')) {
@@ -38,17 +38,22 @@ class Ssmconnector extends Module
     public static $disk_check = null;
     /** Coutures de test : dépôt d'une archive de sauvegarde. */
     public static $uploader = null;
+    /** Connexion directe forcée par les tests (null : lire la constante SSM_CONNECTOR_ALLOW_LOGIN). */
+    public static $login_allowed = null;
     private static $shutdown_registered = false;
     const UPDATE_TTL = 43200;
     const BACKUP_TMP = 'ssm-backup-tmp';
     const PHP_ERRORS_MAX = 100;
     const LOG_READ_MAX = 524288;
+    const LOGIN_LOG_MAX = 20;
+    const LOGIN_MAX_AHEAD = 120;    // secondes : un lien expirant plus loin que cela n'a pas été fait par SSM
+    const ENC_PREFIX = 'enc1:';
 
     public function __construct()
     {
         $this->name = 'ssmconnector';
         $this->tab = 'administration';
-        $this->version = '0.7.0';
+        $this->version = '0.8.0';
         $this->author = 'Selest Informatique';
         $this->need_instance = 0;
         $this->ps_versions_compliancy = ['min' => '8.0.0', 'max' => _PS_VERSION_];
@@ -74,7 +79,32 @@ class Ssmconnector extends Module
         if (class_exists('ZipArchive') && function_exists('curl_init')) {
             $caps[] = 'backup_site';
         }
+        if (self::loginAllowed()) {
+            $caps[] = 'login';
+        }
         return $caps;
+    }
+
+    /**
+     * Connexion directe au back-office depuis SSM : fermée par défaut. Un super-administrateur l'ouvre
+     * dans la page du module (case à cocher), jamais SSM à distance. La constante
+     * SSM_CONNECTOR_ALLOW_LOGIN (config/defines_custom.inc.php) l'emporte : true l'ouvre, false la
+     * verrouille fermée, quoi qu'indique la case.
+     */
+    public static function loginAllowed()
+    {
+        if (self::$login_allowed !== null) {
+            return (bool) self::$login_allowed;
+        }
+        if (self::loginLockedByConstant()) {
+            return (bool) SSM_CONNECTOR_ALLOW_LOGIN;
+        }
+        return (bool) Configuration::get('SSM_LOGIN_ALLOWED');
+    }
+
+    public static function loginLockedByConstant()
+    {
+        return defined('SSM_CONNECTOR_ALLOW_LOGIN');
     }
 
     public function install()
@@ -160,6 +190,7 @@ class Ssmconnector extends Module
 
     public function hookDisplayBackOfficeTop($params)
     {
+        $this->rememberAdminDir();
         $this->maybeRunDueHeartbeat(false);
 
         $ok = (bool) Configuration::get('SSM_HEARTBEAT_OK');
@@ -265,6 +296,7 @@ class Ssmconnector extends Module
         $output .= '<button type="submit" name="submitSSMCheckUpdate" class="btn btn-default">Vérifier les mises à jour</button>';
         $output .= '</form></div>';
 
+        $output .= $this->renderLoginPanel($nonce);
         $output .= $this->renderSecurityPanel();
         $output .= $this->renderScripts();
 
@@ -273,7 +305,7 @@ class Ssmconnector extends Module
 
     private function processForms()
     {
-        $actions = ['submitSSMConfig', 'submitSSMHeartbeatNow', 'submitSSMCheckUpdate'];
+        $actions = ['submitSSMConfig', 'submitSSMHeartbeatNow', 'submitSSMCheckUpdate', 'submitSSMLogin'];
         $submitted = null;
         foreach ($actions as $action) {
             if (Tools::isSubmit($action)) {
@@ -320,6 +352,9 @@ class Ssmconnector extends Module
 
             case 'submitSSMHeartbeatNow':
                 return $this->testConnection();
+
+            case 'submitSSMLogin':
+                return $this->saveLoginSettings();
 
             case 'submitSSMCheckUpdate':
                 $this->getUpdateInfo(true);
@@ -398,6 +433,82 @@ class Ssmconnector extends Module
             . '<code id="ssm-cron" data-value="' . $this->h($command) . '" style="background:#f1f5f9;padding:0.5rem;display:block;word-break:break-all;">' . $this->h($command) . '</code>'
             . '<p style="margin-top:0.5rem;"><button type="button" class="btn btn-default" onclick="ssmCopy(\'ssm-cron\')">Copier la commande</button></p>';
         return $html . '</div>';
+    }
+
+    /** Seul un super-administrateur peut ouvrir la connexion directe : elle peut ouvrir une session de super-administrateur. */
+    private function isSuperAdmin()
+    {
+        $e = $this->context->employee;
+        return isset($e->id_profile) && (int) $e->id_profile === (int) _PS_ADMIN_PROFILE_;
+    }
+
+    /** Employés actifs, pour choisir celui que SSM connectera. */
+    public function activeEmployees()
+    {
+        return Db::getInstance()->executeS('SELECT id_employee, firstname, lastname, email FROM ' . _DB_PREFIX_ . 'employee'
+            . ' WHERE active = 1 ORDER BY id_employee ASC') ?: [];
+    }
+
+    public function saveLoginSettings()
+    {
+        if (!$this->isSuperAdmin()) {
+            return $this->displayError($this->l('Seul un super-administrateur peut régler la connexion directe.'));
+        }
+        if (self::loginLockedByConstant()) {
+            return $this->displayError($this->l('Réglage imposé par SSM_CONNECTOR_ALLOW_LOGIN dans config/defines_custom.inc.php.'));
+        }
+        $employee = (int) Tools::getValue('SSM_LOGIN_EMPLOYEE');
+        if ($employee > 0 && !in_array($employee, array_map('intval', array_column($this->activeEmployees(), 'id_employee')), true)) {
+            return $this->displayError($this->l('Employé inconnu ou inactif.'));
+        }
+        $allowed = Tools::getValue('SSM_LOGIN_ALLOWED') ? 1 : 0;
+        Configuration::updateValue('SSM_LOGIN_ALLOWED', $allowed);
+        Configuration::updateValue('SSM_LOGIN_EMPLOYEE', $employee);
+        if (!$allowed) {
+            // Refermée : la clé et les liens déjà signés cessent de servir tout de suite.
+            Configuration::deleteByName('SSM_LOGIN_KEY');
+            Configuration::deleteByName('SSM_LOGIN_NONCES');
+            return $this->displayConfirmation($this->l('Connexion directe fermée.'));
+        }
+        return $this->displayConfirmation($this->l('Connexion directe ouverte : prête après deux envois à SSM (clé remise, puis confirmée).'));
+    }
+
+    private function renderLoginPanel($nonce)
+    {
+        $locked = self::loginLockedByConstant();
+        $super = $this->isSuperAdmin();
+        $allowed = self::loginAllowed();
+        $html = '<div class="panel"><div class="panel-heading"><i class="icon-key"></i> ' . $this->h($this->l('Connexion directe depuis SSM')) . '</div>';
+        $html .= '<p>' . $this->h($this->l('Un clic dans SSM ouvre ce back-office, sans mot de passe : lien signé, valable 60 secondes, une seule fois. Fermée par défaut ; SSM ne peut pas l\'ouvrir à distance.')) . '</p>';
+        $html .= '<form method="post">' . $nonce;
+        $disabled = ($locked || !$super) ? ' disabled' : '';
+        $html .= '<div class="checkbox"><label><input type="checkbox" name="SSM_LOGIN_ALLOWED" value="1"' . ($allowed ? ' checked' : '') . $disabled . '> '
+            . $this->h($this->l('Autoriser la connexion directe depuis SSM')) . '</label></div>';
+        $chosen = (int) Configuration::get('SSM_LOGIN_EMPLOYEE');
+        $html .= '<div class="form-group"><label>' . $this->h($this->l('Employé connecté')) . '</label><select name="SSM_LOGIN_EMPLOYEE" class="form-control"' . $disabled . '>'
+            . '<option value="0">' . $this->h($this->l('Le premier super-administrateur actif')) . '</option>';
+        foreach ($this->activeEmployees() as $e) {
+            $id = (int) $e['id_employee'];
+            $html .= '<option value="' . $id . '"' . ($id === $chosen ? ' selected' : '') . '>'
+                . $this->h(trim($e['firstname'] . ' ' . $e['lastname']) . ' — ' . $e['email']) . '</option>';
+        }
+        $html .= '</select></div>';
+        if ($locked) {
+            $html .= '<p class="help-block">' . $this->h($allowed
+                ? $this->l('Ouverte et verrouillée par SSM_CONNECTOR_ALLOW_LOGIN dans config/defines_custom.inc.php.')
+                : $this->l('Fermée et verrouillée par SSM_CONNECTOR_ALLOW_LOGIN dans config/defines_custom.inc.php.')) . '</p>';
+        } elseif (!$super) {
+            $html .= '<p class="help-block">' . $this->h($this->l('Réglable par un super-administrateur seulement.')) . '</p>';
+        } else {
+            $html .= '<button type="submit" name="submitSSMLogin" class="btn btn-default">' . $this->h($this->l('Enregistrer')) . '</button>';
+        }
+        if ($allowed) {
+            $html .= '<p class="help-block">' . $this->h($this->loginKey() ? $this->l('Clé reçue de SSM : prête.') : $this->l('Clé pas encore reçue (au prochain envoi).')) . '</p>';
+        }
+        $admin = $this->adminUrl();
+        $html .= '<p><strong>' . $this->h($this->l('Back-office transmis à SSM')) . '</strong> — '
+            . ($admin ? '<code>' . $this->h($admin) . '</code>' : $this->h($this->l('pas encore reconnu.'))) . '</p>';
+        return $html . '</form></div>';
     }
 
     private function renderScripts()
@@ -584,6 +695,13 @@ class Ssmconnector extends Module
         if ($result['ok'] && isset($result['site_id'])) {
             Configuration::updateValue('SSM_SITE_ID', (int) $result['site_id']);
         }
+        // Clé de connexion directe : remise par SSM tant que l'empreinte annoncée diffère de la sienne.
+        // Connexion fermée : la clé est effacée, un lien déjà signé ne peut plus servir.
+        if (!self::loginAllowed()) {
+            Configuration::deleteByName('SSM_LOGIN_KEY');
+        } elseif ($result['ok'] && !empty($result['login_key']) && is_string($result['login_key'])) {
+            Configuration::updateValue('SSM_LOGIN_KEY', self::protect($result['login_key']));
+        }
         // SSM ne touche pas à la boutique : il envoie une instruction, ce module l'exécute et
         // renvoie ce qu'il a obtenu. C'est la seule source qui autorise SSM à écrire « appliquée ».
         if ($result['ok'] && !empty($result['commands'])) {
@@ -704,7 +822,16 @@ class Ssmconnector extends Module
         // rapporté » (null) plutôt que « SSL désactivé », qui serait une affirmation que
         // personne n'a faite. SSM Core 2.7.0 fait précisément cette distinction.
 
-        return [
+        $login = [];
+        if (self::loginAllowed()) {
+            $key = $this->loginKey();
+            $login = [
+                'login_key_fingerprint' => $key ? substr(hash('sha256', $key), 0, 16) : null,
+                'login_url' => $this->cutOrNull($this->context->link->getModuleLink($this->name, 'login', [], true), 500),
+            ];
+        }
+
+        return $login + [
             // lus par SSM Core
             'cms_version' => $this->cut(_PS_VERSION_, 50),
             'php_version' => PHP_MAJOR_VERSION . '.' . PHP_MINOR_VERSION . '.' . PHP_RELEASE_VERSION,
@@ -731,7 +858,9 @@ class Ssmconnector extends Module
             'capabilities' => $this->capabilities(),
             'command_results' => $this->takeCommandResults(),
             'php_errors' => $this->takePhpErrors(),
-            'login_enabled' => false,
+            'login_enabled' => self::loginAllowed(),
+            // adresse réelle du back-office (son dossier est renommé à l'installation) ; null si introuvable
+            'admin_url' => $this->cutOrNull($this->adminUrl(), 500),
             // compteurs métier, lus par SSM Core depuis la 2.7.0
             'stats' => $stats,
             // informatifs (conservés, pas encore lus)
@@ -997,6 +1126,7 @@ class Ssmconnector extends Module
             'http_code' => $http_code,
             'hint' => '',
             'site_id' => is_array($json) && isset($json['site_id']) ? (int) $json['site_id'] : null,
+            'login_key' => is_array($json) && isset($json['login_key']) && is_string($json['login_key']) ? $json['login_key'] : null,
             // Les instructions de mise à jour éventuelles : un connecteur plus ancien ne les lit pas,
             // et une boutique portant une version antérieure reste parfaitement fonctionnelle.
             'commands' => (is_array($json) && !empty($json['commands']) && is_array($json['commands']))
@@ -1627,6 +1757,233 @@ class Ssmconnector extends Module
     }
 
     /** Explique un échec d'envoi en langage clair, avec l'action à mener. Ne cite jamais le token. */
+    // === Adresse du back-office ===
+    //
+    // PrestaShop renomme le dossier d'administration à l'installation (admin123abc…) : SSM ne peut
+    // pas le deviner. Le module le lit quand il tourne dans le back-office (_PS_ADMIN_DIR_), sinon
+    // il cherche à la racine le dossier qui porte les fichiers propres au back-office.
+
+    public function rememberAdminDir()
+    {
+        if (defined('_PS_ADMIN_DIR_')) {
+            $dir = basename(rtrim((string) _PS_ADMIN_DIR_, '/\\'));
+            if ($dir !== '' && $dir !== (string) Configuration::get('SSM_ADMIN_DIR')) {
+                Configuration::updateValue('SSM_ADMIN_DIR', $dir);
+            }
+        }
+    }
+
+    public function isAdminDir($path)
+    {
+        return is_dir($path) && is_file($path . '/index.php')
+            && (is_file($path . '/get-file-admin.php') || (is_file($path . '/init.php') && is_dir($path . '/filemanager')));
+    }
+
+    public function adminDir()
+    {
+        $this->rememberAdminDir();
+        $root = rtrim((string) _PS_ROOT_DIR_, '/\\');
+        $known = (string) Configuration::get('SSM_ADMIN_DIR');
+        if ($known !== '' && strpbrk($known, '/\\') === false && $this->isAdminDir($root . '/' . $known)) {
+            return $known;
+        }
+        $found = [];
+        foreach (glob($root . '/*', GLOB_ONLYDIR) ?: [] as $path) {
+            if ($this->isAdminDir($path)) {
+                $found[] = basename($path);
+            }
+        }
+        // Plusieurs candidats (copie de sauvegarde du dossier…) : on ne choisit pas au hasard.
+        if (count($found) !== 1) {
+            return null;
+        }
+        Configuration::updateValue('SSM_ADMIN_DIR', $found[0]);
+        return $found[0];
+    }
+
+    public function adminUrl()
+    {
+        $dir = $this->adminDir();
+        if ($dir === null) {
+            return null;
+        }
+        $base = method_exists('Tools', 'getShopDomainSsl') ? Tools::getShopDomainSsl(true) : Tools::getShopDomain(true);
+        $uri = defined('__PS_BASE_URI__') ? __PS_BASE_URI__ : '/';
+        return rtrim((string) $base, '/') . '/' . trim($uri, '/') . (trim($uri, '/') === '' ? '' : '/') . rawurlencode($dir) . '/';
+    }
+
+    // === Connexion directe au back-office (seulement si SSM_CONNECTOR_ALLOW_LOGIN) ===
+    //
+    // 1. SSM remet une clé propre à la boutique dans la réponse au heartbeat ; elle est stockée chiffrée.
+    // 2. Un lien SSM porte un jeton signé HMAC-SHA256 avec cette clé : site, demandeur, expiration à
+    //    60 secondes, nonce. Il n'est accepté qu'une fois.
+    // 3. Le module ouvre alors une session pour l'employé désigné par la boutique
+    //    (SSM_CONNECTOR_LOGIN_EMPLOYEE), sinon le premier super-administrateur actif ; jamais un
+    //    compte choisi par SSM.
+
+    private static function cryptoKey()
+    {
+        return hash('sha256', 'ssmconnector-login|' . _COOKIE_KEY_, true);
+    }
+
+    public static function protect($plain)
+    {
+        if (!function_exists('sodium_crypto_secretbox')) {
+            return $plain;
+        }
+        $nonce = random_bytes(SODIUM_CRYPTO_SECRETBOX_NONCEBYTES);
+        return self::ENC_PREFIX . base64_encode($nonce . sodium_crypto_secretbox($plain, $nonce, self::cryptoKey()));
+    }
+
+    public static function reveal($stored)
+    {
+        $stored = (string) $stored;
+        if (strpos($stored, self::ENC_PREFIX) !== 0) {
+            return $stored === '' ? null : $stored;
+        }
+        if (!function_exists('sodium_crypto_secretbox_open')) {
+            return null;
+        }
+        $raw = base64_decode(substr($stored, strlen(self::ENC_PREFIX)), true);
+        if ($raw === false || strlen($raw) <= SODIUM_CRYPTO_SECRETBOX_NONCEBYTES) {
+            return null;
+        }
+        $plain = sodium_crypto_secretbox_open(substr($raw, SODIUM_CRYPTO_SECRETBOX_NONCEBYTES),
+            substr($raw, 0, SODIUM_CRYPTO_SECRETBOX_NONCEBYTES), self::cryptoKey());
+        return $plain === false ? null : $plain;
+    }
+
+    public function loginKey()
+    {
+        return self::reveal((string) Configuration::get('SSM_LOGIN_KEY'));
+    }
+
+    private static function b64urlDecode($s)
+    {
+        return base64_decode(strtr($s, '-_', '+/') . str_repeat('=', (4 - strlen($s) % 4) % 4), true);
+    }
+
+    /** Vérifie un jeton de connexion. Renvoie l'employé à connecter, ou la raison du refus (texte). */
+    public function verifyLoginToken($token)
+    {
+        if (!self::loginAllowed()) {
+            return 'connexion directe désactivée sur cette boutique';
+        }
+        $key = $this->loginKey();
+        if (!$key) {
+            return 'clé de connexion pas encore reçue de SSM';
+        }
+        $parts = explode('.', (string) $token);
+        if (count($parts) !== 2 || $parts[0] === '' || $parts[1] === '') {
+            return 'jeton illisible';
+        }
+        $expected = rtrim(strtr(base64_encode(hash_hmac('sha256', $parts[0], $key, true)), '+/', '-_'), '=');
+        if (!hash_equals($expected, $parts[1])) {
+            return 'signature invalide';
+        }
+        $claims = json_decode((string) self::b64urlDecode($parts[0]), true);
+        if (!is_array($claims) || !isset($claims['exp'], $claims['n'])) {
+            return 'jeton incomplet';
+        }
+        $now = time();
+        if ($now > (int) $claims['exp']) {
+            return 'lien expiré (60 secondes)';
+        }
+        if ((int) $claims['exp'] - $now > self::LOGIN_MAX_AHEAD) {
+            return 'expiration invalide';
+        }
+        $site_id = (int) Configuration::get('SSM_SITE_ID');
+        if ($site_id && isset($claims['s']) && (int) $claims['s'] !== $site_id) {
+            return 'lien destiné à un autre site';
+        }
+        // Nonces déjà servis : gardés jusqu'à leur expiration, puis oubliés.
+        $used = json_decode((string) Configuration::get('SSM_LOGIN_NONCES'), true);
+        $used = is_array($used) ? array_filter($used, function ($exp) use ($now) {
+            return (int) $exp >= $now;
+        }) : [];
+        $nonce = hash('sha256', (string) $claims['n']);
+        if (isset($used[$nonce])) {
+            return 'lien déjà utilisé';
+        }
+        $used[$nonce] = (int) $claims['exp'];
+        Configuration::updateValue('SSM_LOGIN_NONCES', json_encode(array_slice($used, -200, null, true)));
+
+        $employee = $this->loginEmployee();
+        if (!$employee) {
+            return 'aucun employé à connecter (employé choisi introuvable ou inactif, ou aucun super-administrateur actif)';
+        }
+        $log = json_decode((string) Configuration::get('SSM_LOGIN_LOG'), true);
+        $log = is_array($log) ? $log : [];
+        array_unshift($log, ['at' => date('Y-m-d H:i:s'), 'by' => substr((string) ($claims['u'] ?? ''), 0, 64), 'as' => (string) $employee->email]);
+        Configuration::updateValue('SSM_LOGIN_LOG', json_encode(array_slice($log, 0, self::LOGIN_LOG_MAX)));
+        return $employee;
+    }
+
+    /** L'employé désigné (constante, sinon page du module), sinon le premier super-administrateur actif. */
+    public function loginEmployee()
+    {
+        if (defined('SSM_CONNECTOR_LOGIN_EMPLOYEE') && SSM_CONNECTOR_LOGIN_EMPLOYEE) {
+            $email = (string) SSM_CONNECTOR_LOGIN_EMPLOYEE;
+            if (!Validate::isEmail($email)) {
+                return null;
+            }
+            $employee = new Employee();
+            return $employee->getByEmail($email) ? $employee : null;   // actifs seulement
+        }
+        $chosen = (int) Configuration::get('SSM_LOGIN_EMPLOYEE');   // choisi dans la page du module
+        if ($chosen > 0) {
+            $employee = new Employee($chosen);
+            return Validate::isLoadedObject($employee) && $employee->active ? $employee : null;
+        }
+        $id = (int) Db::getInstance()->getValue('SELECT id_employee FROM ' . _DB_PREFIX_ . 'employee'
+            . ' WHERE active = 1 AND id_profile = ' . (int) _PS_ADMIN_PROFILE_ . ' ORDER BY id_employee ASC');
+        if (!$id) {
+            return null;
+        }
+        $employee = new Employee($id);
+        return Validate::isLoadedObject($employee) && $employee->active ? $employee : null;
+    }
+
+    /**
+     * Ouvre la session du back-office, comme AdminLoginController::processLogin() de PrestaShop :
+     * même cookie (psAdmin, mêmes durée et option SSL que config/config.inc.php), même session employé.
+     */
+    public function openBackOfficeSession($employee)
+    {
+        $lifetime = (int) Configuration::get('PS_COOKIE_LIFETIME_BO');
+        if ($lifetime > 0) {
+            $lifetime = time() + (max($lifetime, 1) * 3600);
+        }
+        $force_ssl = Configuration::get('PS_SSL_ENABLED') && Configuration::get('PS_SSL_ENABLED_EVERYWHERE');
+        $cookie = new Cookie('psAdmin', '', $lifetime, null, false, $force_ssl);
+        $employee->remote_addr = (int) ip2long(Tools::getRemoteAddr());
+        $cookie->id_employee = (int) $employee->id;
+        $cookie->email = $employee->email;
+        $cookie->profile = $employee->id_profile;
+        $cookie->passwd = $employee->passwd;
+        $cookie->remote_addr = $employee->remote_addr;
+        if (method_exists($cookie, 'registerSession') && class_exists('EmployeeSession')) {
+            $cookie->registerSession(new EmployeeSession());
+        }
+        $cookie->last_activity = time();
+        $cookie->write();
+        if (class_exists('PrestaShopLogger')) {
+            PrestaShopLogger::addLog('Connexion au back-office depuis SSM', 1, null, '', 0, true, (int) $employee->id);
+        }
+        return $cookie;
+    }
+
+    /** Tableau de bord du back-office, avec le jeton qu'AdminController attend pour cet employé. */
+    public function dashboardUrl($employee)
+    {
+        $admin = $this->adminUrl();
+        if ($admin === null) {
+            return null;
+        }
+        $token = Tools::getAdminToken('AdminDashboard' . (int) Tab::getIdFromClassName('AdminDashboard') . (int) $employee->id);
+        return $admin . 'index.php?controller=AdminDashboard&token=' . $token;
+    }
+
     public function describeFailure($http_code, $errno, $body = '')
     {
         if ($errno === 6) {
