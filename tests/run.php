@@ -926,6 +926,11 @@ test("sauvegarde : base et fichiers dans l'archive, caches exclus, dossier de tr
     $m->applyCommands([['id' => 9, 'ref' => 'command', 'kind' => 'backup_site',
         'params' => ['upload_url' => 'https://s3.example/k.zip?sig=x', 'include_uploads' => false]]]);
     $r = $m->takeCommandResults()[0];
+    if (!class_exists('ZipArchive')) {       // PHP sans l'extension zip : échec dit, rien de tenté
+        same($r['status'], 'failed', 'sans zip : sauvegarde refusée');
+        check(strpos($r['error'] ?? '', 'zip') !== false, 'sans zip : raison donnée');
+        return;
+    }
     same($r['status'], 'success', 'sauvegarde réussie');
     same($r['data']['tables'], 2, 'deux tables');
     check(in_array('boutique/modules/blockreassurance/config.xml', $vu['names'], true), 'fichiers de la boutique');
