@@ -2,6 +2,21 @@
 
 Format inspiré de [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/), versions sémantiques.
 
+## [0.8.0] - 2026-10-09
+
+### Ajouté
+- **Adresse réelle du back-office** (`admin_url`) envoyée à SSM. Le dossier d'administration étant
+  renommé à l'installation, SSM affichait un lien inventé (`/admin-dev/`). Le module la lit dans le
+  back-office ou la retrouve à la racine, et n'envoie rien s'il y a un doute (plusieurs candidats).
+- **Connexion directe au back-office depuis SSM**, fermée par défaut : constante
+  `SSM_CONNECTOR_ALLOW_LOGIN` dans `config/defines_custom.inc.php`, employé facultatif
+  `SSM_CONNECTOR_LOGIN_EMPLOYEE`. La clé remise par SSM est stockée chiffrée (libsodium). Le lien signé
+  HMAC-SHA256 est valable 60 s et une seule fois, et vérifié pour le bon site. La session est ouverte
+  comme par la page de connexion de PrestaShop (cookie `psAdmin`, session employé), y compris en mode
+  maintenance. Chaque connexion est journalisée. Testée sur un PrestaShop 8.2 réel : refus (fermée, clé
+  absente, autre site, mauvaise clé, lien rejoué), puis ouverture du tableau de bord.
+- Page du module : état de la connexion directe et adresse du back-office transmise.
+
 ## [0.7.0] - 2026-10-09
 
 ### Ajouté

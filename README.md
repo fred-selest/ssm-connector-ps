@@ -62,7 +62,7 @@ Pour un envoi à heure fixe, même sans visite, planifier toutes les 5 minutes (
 
 Le heartbeat n'est envoyé que si l'intervalle configuré est écoulé ; ajouter `?force=1` pour l'envoyer immédiatement. Le token se passe **uniquement dans l'en-tête** : il n'est plus accepté dans l'adresse (changement depuis la 0.3.0).
 
-## Ce que SSM peut demander (0.7.0)
+## Ce que SSM peut demander (0.8.0)
 
 Rien n'est exécuté sans demande de SSM ; le compte rendu part au heartbeat suivant.
 
@@ -74,7 +74,33 @@ Rien n'est exécuté sans demande de SSM ; le compte rendu part au heartbeat sui
 Le module remonte aussi les **erreurs PHP** (fatales, et celles du journal de PHP), chemins relatifs à la boutique.
 
 **Pas encore** : la mise à jour de modules (elle appelait une méthode qui n'existe pas dans PrestaShop et
-échouait toujours ; elle n'est plus annoncée à SSM), la connexion directe au back-office.
+échouait toujours ; elle n'est plus annoncée à SSM).
+
+## Back-office et connexion directe (0.8.0)
+
+**Adresse du back-office.** PrestaShop renomme le dossier d'administration à l'installation
+(`admin4f7k2q`…) : SSM ne peut pas le deviner. Le module transmet l'adresse réelle (`admin_url`). Il la
+lit dès qu'un employé ouvre le back-office, sinon il cherche à la racine le dossier qui contient les
+fichiers propres au back-office. S'il en trouve plusieurs (copie de sauvegarde du dossier…), il ne
+choisit pas : rien n'est transmis tant que le back-office n'a pas été ouvert.
+
+**Connexion directe depuis SSM** : un clic dans SSM ouvre le back-office, sans mot de passe. Elle est
+**fermée par défaut**. Pour l'ouvrir, ajoutez dans `config/defines_custom.inc.php` (fichier conservé par
+les mises à jour de PrestaShop ; créez-le s'il n'existe pas) :
+
+```php
+<?php
+define('SSM_CONNECTOR_ALLOW_LOGIN', true);
+// facultatif : l'employé connecté (sinon le premier super-administrateur actif)
+define('SSM_CONNECTOR_LOGIN_EMPLOYEE', 'email@employe.fr');
+```
+
+Au heartbeat suivant, SSM remet au module une clé propre à la boutique, qui est stockée chiffrée. Un
+heartbeat plus tard, la connexion est prête. Chaque lien est signé avec cette clé, valable 60 secondes
+et **une seule fois**. Il ouvre la session de l'employé désigné par la boutique, jamais un compte
+choisi par SSM, y compris en mode maintenance. Chaque connexion est inscrite dans les journaux de
+PrestaShop (« Connexion au back-office depuis SSM ») et dans la page du module. Retirer la constante
+referme la porte et efface la clé.
 
 ## Sécurité
 

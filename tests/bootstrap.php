@@ -8,6 +8,8 @@ define('_PS_MODE_DEV_', false);
 define('_PS_ROOT_DIR_', sys_get_temp_dir() . '/ssm-fake-ps/');
 define('_PS_MODULE_DIR_', _PS_ROOT_DIR_ . '/modules');
 define('_COOKIE_KEY_', 'cle-de-test');
+define('__PS_BASE_URI__', '/');
+define('_PS_ADMIN_PROFILE_', 1);
 
 class Configuration
 {
@@ -61,6 +63,49 @@ class Tools
     public static function getValue($k) { return isset(self::$values[$k]) ? self::$values[$k] : null; }
     public static function isSubmit($k) { return in_array($k, self::$submitted, true); }
     public static function getRemoteAddr() { return '203.0.113.9'; }
+    public static function getShopDomainSsl($http = false) { return self::$shop_domain; }
+    public static function getAdminToken($s) { return md5('jeton|' . $s); }
+}
+
+class Validate
+{
+    public static function isEmail($e) { return (bool) filter_var($e, FILTER_VALIDATE_EMAIL); }
+    public static function isLoadedObject($o) { return is_object($o) && !empty($o->id); }
+}
+
+class Tab { public static function getIdFromClassName($c) { return 1; } }
+
+/** Employés de la fausse boutique : id => [email, actif]. Db::getValue() renvoie l'identifiant demandé par les tests. */
+class Employee
+{
+    public static $rows = [12 => ['admin@boutique.fr', 1]];
+    public $id; public $email; public $active; public $id_profile = 1; public $passwd = 'hash'; public $remote_addr;
+    public function __construct($id = null)
+    {
+        if ($id !== null && isset(self::$rows[$id])) {
+            $this->id = $id;
+            list($this->email, $this->active) = self::$rows[$id];
+        }
+    }
+    public function getByEmail($email)
+    {
+        foreach (self::$rows as $id => $r) {
+            if ($r[0] === $email && $r[1]) {
+                $this->__construct($id);
+                return $this;
+            }
+        }
+        return false;
+    }
+}
+
+/** Cookie du back-office : les tests lisent ce qui a été écrit. */
+class Cookie
+{
+    public static $written = [];
+    public $args;
+    public function __construct(...$args) { $this->args = $args; }
+    public function write() { self::$written[] = ['args' => $this->args, 'values' => get_object_vars($this)]; }
 }
 
 class Theme
@@ -72,7 +117,7 @@ class Theme
     public function getVersion() { return '1.7.2'; }
 }
 
-class FakeLink { public function getModuleLink($module, $controller) { return 'https://boutique.exemple.fr/module/' . $module . '/' . $controller; } }
+class FakeLink { public function getModuleLink($module, $controller, $params = [], $ssl = null) { return 'https://boutique.exemple.fr/module/' . $module . '/' . $controller; } }
 
 class Module
 {

@@ -875,7 +875,9 @@ test("contrat 3 : capacités annoncées, pas de connexion directe", function () 
         check(in_array($c, $inv['capabilities'], true), "capacité $c");
     }
     check(!in_array('update_extension', $inv['capabilities'], true), "pas de mise à jour annoncée : Module::upgrade() n'existe pas dans PrestaShop");
-    same($inv['login_enabled'], false, 'pas de connexion directe pour PrestaShop');
+    same($inv['login_enabled'], false, 'connexion directe fermée par défaut');
+    check(!in_array('login', $inv['capabilities'], true), "pas de capacité login par défaut");
+    check(!array_key_exists('login_url', $inv) && !array_key_exists('login_key_fingerprint', $inv), 'ni adresse ni empreinte de connexion par défaut');
     same($inv['command_results'], [], 'aucun compte rendu au départ');
 });
 
@@ -950,6 +952,115 @@ test("script de mise à niveau 0.6.0 et 0.7.0 : fonctions appelées par PrestaSh
     $m = fresh();
     check(function_exists('upgrade_module_0_6_0') && upgrade_module_0_6_0($m), 'upgrade_module_0_6_0');
     check(function_exists('upgrade_module_0_7_0') && upgrade_module_0_7_0($m), 'upgrade_module_0_7_0');
+});
+
+// --- 0.8.0 : adresse du back-office, connexion directe ---
+
+function admin_dir($name)
+{
+    $d = _PS_ROOT_DIR_ . '/' . $name;
+    @mkdir($d . '/filemanager', 0755, true);
+    file_put_contents($d . '/index.php', "<?php\n");
+    file_put_contents($d . '/get-file-admin.php', "<?php\n");
+    return $d;
+}
+
+/** Jeton signé exactement comme SSM Core (app/login_links.make_link). */
+function ssm_token($key, array $claims)
+{
+    $b64 = function ($raw) { return rtrim(strtr(base64_encode($raw), '+/', '-_'), '='); };
+    $payload = $b64(json_encode($claims));
+    return $payload . '.' . $b64(hash_hmac('sha256', $payload, $key, true));
+}
+
+test("back-office : adresse réelle du dossier renommé, jamais devinée", function () {
+    $m = fresh();
+    ssm_reset_modules();
+    same($m->adminUrl(), null, "aucun dossier d'administration : pas d'adresse");
+    @mkdir(_PS_ROOT_DIR_ . '/img', 0755, true);   // un dossier ordinaire n'est pas pris pour le back-office
+    admin_dir('admin4f7k2q');
+    same($m->adminUrl(), 'https://boutique.exemple.fr/admin4f7k2q/', 'dossier reconnu à ses fichiers');
+    same(Configuration::get('SSM_ADMIN_DIR'), 'admin4f7k2q', 'retenu');
+    same(priv($m, 'collectInventory')['admin_url'], 'https://boutique.exemple.fr/admin4f7k2q/', "envoyé à SSM");
+    admin_dir('admin-copie');
+    same($m->adminUrl(), 'https://boutique.exemple.fr/admin4f7k2q/', 'le dossier retenu reste valable');
+    Configuration::deleteByName('SSM_ADMIN_DIR');
+    same($m->adminUrl(), null, 'deux candidats et rien de retenu : on ne choisit pas au hasard');
+    Configuration::updateValue('SSM_ADMIN_DIR', '../etc');
+    same($m->adminUrl(), null, 'valeur retenue suspecte ignorée');
+    ssm_reset_modules();
+});
+
+test("connexion directe : ouverte par la constante, clé reçue au heartbeat et stockée chiffrée", function () {
+    $m = fresh();
+    configure($m);
+    SsmConnector::$login_allowed = true;
+    $inv = priv($m, 'collectInventory');
+    same($inv['login_enabled'], true, 'annoncée');
+    check(in_array('login', $inv['capabilities'], true), 'capacité login');
+    same($inv['login_url'], 'https://boutique.exemple.fr/module/ssmconnector/login', 'adresse du contrôleur de connexion');
+    same($inv['login_key_fingerprint'], null, 'pas encore de clé');
+    core_replies(200, ['site_id' => 42, 'login_key' => 'cle-remise-par-ssm']);
+    check(priv($m, 'sendHeartbeat')['ok'], 'heartbeat accepté');
+    $stored = (string) Configuration::get('SSM_LOGIN_KEY');
+    check(strpos($stored, SsmConnector::ENC_PREFIX) === 0 && strpos($stored, 'cle-remise-par-ssm') === false, 'clé chiffrée');
+    same($m->loginKey(), 'cle-remise-par-ssm', 'clé relue');
+    same(priv($m, 'collectInventory')['login_key_fingerprint'], substr(hash('sha256', 'cle-remise-par-ssm'), 0, 16), 'empreinte annoncée à SSM');
+    SsmConnector::$login_allowed = false;
+    core_replies(200, ['site_id' => 42, 'login_key' => 'autre']);
+    priv($m, 'sendHeartbeat');
+    same(Configuration::get('SSM_LOGIN_KEY'), false, 'connexion refermée : clé effacée, même si SSM en renvoie une');
+    SsmConnector::$login_allowed = null;
+});
+
+test("connexion directe : jeton vérifié (signature, expiration, site, usage unique)", function () {
+    $m = fresh();
+    Db::$counts = [12];   // premier super-administrateur actif
+    $key = 'cle-0123456789';
+    Configuration::updateValue('SSM_LOGIN_KEY', SsmConnector::protect($key));
+    Configuration::updateValue('SSM_SITE_ID', 42);
+    $ok = ['s' => 42, 'u' => 'fred', 'exp' => time() + 60, 'n' => 'nonce-1'];
+    same($m->verifyLoginToken(ssm_token($key, $ok)), 'connexion directe désactivée sur cette boutique', 'fermée par défaut');
+    SsmConnector::$login_allowed = true;
+    $e = $m->verifyLoginToken(ssm_token($key, $ok));
+    check($e instanceof Employee && $e->id === 12, 'employé connecté : premier super-administrateur');
+    same($m->verifyLoginToken(ssm_token($key, $ok)), 'lien déjà utilisé', 'usage unique');
+    same($m->verifyLoginToken(ssm_token('autre', ['n' => 'x'] + $ok)), 'signature invalide', 'autre clé');
+    same($m->verifyLoginToken(ssm_token($key, ['exp' => time() - 1, 'n' => 'n2'] + $ok)), 'lien expiré (60 secondes)', 'expiré');
+    same($m->verifyLoginToken(ssm_token($key, ['exp' => time() + 3600, 'n' => 'n3'] + $ok)), 'expiration invalide', 'trop loin dans le futur');
+    same($m->verifyLoginToken(ssm_token($key, ['s' => 7, 'n' => 'n4'] + $ok)), 'lien destiné à un autre site', 'autre site');
+    same($m->verifyLoginToken('abc'), 'jeton illisible', 'jeton illisible');
+    $log = json_decode(Configuration::get('SSM_LOGIN_LOG'), true);
+    same([$log[0]['by'], $log[0]['as']], ['fred', 'admin@boutique.fr'], 'connexion journalisée : qui, sous quel compte');
+    Db::$counts = [0];
+    same($m->verifyLoginToken(ssm_token($key, ['n' => 'n5'] + $ok)), 'aucun employé à connecter (SSM_CONNECTOR_LOGIN_EMPLOYEE introuvable ou inactif, ou aucun super-administrateur actif)', 'personne à connecter');
+    Db::$counts = null;
+    SsmConnector::$login_allowed = null;
+});
+
+test("connexion directe : session du back-office ouverte comme par la page de connexion", function () {
+    $m = fresh();
+    Cookie::$written = [];
+    Configuration::updateValue('PS_COOKIE_LIFETIME_BO', 480);
+    $e = new Employee(12);
+    $m->openBackOfficeSession($e);
+    $w = Cookie::$written[0];
+    same($w['args'][0], 'psAdmin', 'cookie du back-office');
+    same([$w['values']['id_employee'], $w['values']['email'], $w['values']['passwd']], [12, 'admin@boutique.fr', 'hash'], 'employé et empreinte du mot de passe');
+    same($w['values']['remote_addr'], (int) ip2long('203.0.113.9'), 'adresse IP (contrôle PS_COOKIE_CHECKIP)');
+    check($w['args'][2] > time() + 3600, 'durée du cookie du back-office');
+    ssm_reset_modules();
+    admin_dir('admin4f7k2q');
+    same($m->dashboardUrl($e), 'https://boutique.exemple.fr/admin4f7k2q/index.php?controller=AdminDashboard&token=' . md5('jeton|AdminDashboard112'), 'tableau de bord avec son jeton');
+    ssm_reset_modules();
+});
+
+test("script de mise à niveau 0.8.0", function () {
+    require_once dirname(__DIR__) . '/upgrade/upgrade-0.8.0.php';
+    $m = fresh();
+    Configuration::updateValue('SSM_LOGIN_KEY', 'x');
+    check(function_exists('upgrade_module_0_8_0') && upgrade_module_0_8_0($m), 'upgrade_module_0_8_0');
+    same(Configuration::get('SSM_LOGIN_KEY'), false, 'aucune clé héritée');
 });
 
 echo "\n$checks vérifications, $failures échec(s)\n";
