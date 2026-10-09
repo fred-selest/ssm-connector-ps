@@ -85,13 +85,18 @@ fichiers propres au back-office. S'il en trouve plusieurs (copie de sauvegarde d
 choisit pas : rien n'est transmis tant que le back-office n'a pas été ouvert.
 
 **Connexion directe depuis SSM** : un clic dans SSM ouvre le back-office, sans mot de passe. Elle est
-**fermée par défaut**. Pour l'ouvrir, ajoutez dans `config/defines_custom.inc.php` (fichier conservé par
-les mises à jour de PrestaShop ; créez-le s'il n'existe pas) :
+**fermée par défaut**, et SSM ne peut pas l'ouvrir à distance. Pour l'ouvrir, un **super-administrateur**
+coche « Autoriser la connexion directe depuis SSM » dans la page du module et choisit l'employé connecté
+(par défaut : le premier super-administrateur actif).
+
+La constante, dans `config/defines_custom.inc.php` (fichier conservé par les mises à jour de PrestaShop),
+**l'emporte sur la case** : `true` l'ouvre, `false` la verrouille fermée. C'est utile à un hébergeur ou
+à un client qui veut l'interdire.
 
 ```php
 <?php
-define('SSM_CONNECTOR_ALLOW_LOGIN', true);
-// facultatif : l'employé connecté (sinon le premier super-administrateur actif)
+define('SSM_CONNECTOR_ALLOW_LOGIN', false);   // verrou : fermée, case grisée
+// facultatif, prioritaire sur le choix de la page du module
 define('SSM_CONNECTOR_LOGIN_EMPLOYEE', 'email@employe.fr');
 ```
 
@@ -99,8 +104,8 @@ Au heartbeat suivant, SSM remet au module une clé propre à la boutique, qui es
 heartbeat plus tard, la connexion est prête. Chaque lien est signé avec cette clé, valable 60 secondes
 et **une seule fois**. Il ouvre la session de l'employé désigné par la boutique, jamais un compte
 choisi par SSM, y compris en mode maintenance. Chaque connexion est inscrite dans les journaux de
-PrestaShop (« Connexion au back-office depuis SSM ») et dans la page du module. Retirer la constante
-referme la porte et efface la clé.
+PrestaShop (« Connexion au back-office depuis SSM ») et dans la page du module. Décocher la case (ou
+poser la constante à `false`) referme la porte et efface la clé.
 
 ## Sécurité
 

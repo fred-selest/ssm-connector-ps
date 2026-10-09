@@ -1033,7 +1033,7 @@ test("connexion directe : jeton vérifié (signature, expiration, site, usage un
     $log = json_decode(Configuration::get('SSM_LOGIN_LOG'), true);
     same([$log[0]['by'], $log[0]['as']], ['fred', 'admin@boutique.fr'], 'connexion journalisée : qui, sous quel compte');
     Db::$counts = [0];
-    same($m->verifyLoginToken(ssm_token($key, ['n' => 'n5'] + $ok)), 'aucun employé à connecter (SSM_CONNECTOR_LOGIN_EMPLOYEE introuvable ou inactif, ou aucun super-administrateur actif)', 'personne à connecter');
+    same($m->verifyLoginToken(ssm_token($key, ['n' => 'n5'] + $ok)), 'aucun employé à connecter (employé choisi introuvable ou inactif, ou aucun super-administrateur actif)', 'personne à connecter');
     Db::$counts = null;
     SsmConnector::$login_allowed = null;
 });
@@ -1055,12 +1055,63 @@ test("connexion directe : session du back-office ouverte comme par la page de co
     ssm_reset_modules();
 });
 
+test("connexion directe : case à cocher de la page du module, réservée au super-administrateur", function () {
+    $m = fresh();
+    same(SsmConnector::loginAllowed(), false, 'fermée par défaut');
+    Tools::$submitted = ['submitSSMLogin'];
+    Tools::$values = ['ssm_nonce' => priv($m, 'nonce'), 'SSM_LOGIN_ALLOWED' => '1', 'SSM_LOGIN_EMPLOYEE' => '15'];
+    $out = $m->getContent();
+    check(strpos($out, 'Connexion directe ouverte') !== false, 'ouverte par la case');
+    same(SsmConnector::loginAllowed(), true, 'ouverte');
+    same((int) Configuration::get('SSM_LOGIN_EMPLOYEE'), 15, 'employé choisi retenu');
+    check(strpos($out, 'Bob Vendeur — bob@boutique.fr') !== false && strpos($out, 'name="SSM_LOGIN_ALLOWED" value="1" checked') !== false, 'formulaire rempli');
+    same($m->loginEmployee()->id, 15, "c'est cet employé qui sera connecté");
+    Configuration::updateValue('SSM_LOGIN_EMPLOYEE', 16);
+    same($m->loginEmployee(), null, 'employé devenu inactif : personne, pas un autre');
+
+    Tools::$values = ['ssm_nonce' => priv($m, 'nonce'), 'SSM_LOGIN_ALLOWED' => '1', 'SSM_LOGIN_EMPLOYEE' => '99'];
+    check(strpos($m->getContent(), 'Employé inconnu ou inactif') !== false, 'employé inconnu refusé');
+
+    Configuration::updateValue('SSM_LOGIN_KEY', 'x');
+    Configuration::updateValue('SSM_LOGIN_NONCES', '{"a":1}');
+    Tools::$values = ['ssm_nonce' => priv($m, 'nonce'), 'SSM_LOGIN_EMPLOYEE' => '0'];
+    check(strpos($m->getContent(), 'Connexion directe fermée') !== false, 'case décochée');
+    same([SsmConnector::loginAllowed(), Configuration::get('SSM_LOGIN_KEY'), Configuration::get('SSM_LOGIN_NONCES')], [false, false, false],
+        'refermée : clé et nonces effacés aussitôt');
+
+    $m->context->employee = (object) ['id' => 8, 'id_profile' => 4];
+    Tools::$values = ['ssm_nonce' => priv($m, 'nonce'), 'SSM_LOGIN_ALLOWED' => '1'];
+    $out = $m->getContent();
+    check(strpos($out, 'Seul un super-administrateur') !== false && !SsmConnector::loginAllowed(), 'autre profil : refusé');
+    check(strpos($out, 'name="SSM_LOGIN_ALLOWED" value="1" disabled') !== false, 'case grisée pour un autre profil');
+
+    Tools::$values = ['ssm_nonce' => 'faux', 'SSM_LOGIN_ALLOWED' => '1'];
+    $m->context->employee = (object) ['id' => 7, 'id_profile' => 1];
+    $m->getContent();
+    same(SsmConnector::loginAllowed(), false, 'jeton anti-CSRF exigé');
+    Tools::$submitted = [];
+});
+
 test("script de mise à niveau 0.8.0", function () {
     require_once dirname(__DIR__) . '/upgrade/upgrade-0.8.0.php';
     $m = fresh();
     Configuration::updateValue('SSM_LOGIN_KEY', 'x');
     check(function_exists('upgrade_module_0_8_0') && upgrade_module_0_8_0($m), 'upgrade_module_0_8_0');
     same(Configuration::get('SSM_LOGIN_KEY'), false, 'aucune clé héritée');
+});
+
+// En dernier : une constante PHP ne se retire plus une fois définie.
+test("connexion directe : la constante l'emporte sur la case (verrou fermé)", function () {
+    $m = fresh();
+    define('SSM_CONNECTOR_ALLOW_LOGIN', false);
+    Configuration::updateValue('SSM_LOGIN_ALLOWED', 1);
+    same(SsmConnector::loginAllowed(), false, 'constante à false : fermée malgré la case');
+    Tools::$submitted = ['submitSSMLogin'];
+    Tools::$values = ['ssm_nonce' => priv($m, 'nonce'), 'SSM_LOGIN_ALLOWED' => '1'];
+    $out = $m->getContent();
+    check(strpos($out, 'Réglage imposé par SSM_CONNECTOR_ALLOW_LOGIN') !== false, 'réglage refusé, avec la raison');
+    check(strpos($out, 'Fermée et verrouillée') !== false, 'verrou affiché');
+    Tools::$submitted = [];
 });
 
 echo "\n$checks vérifications, $failures échec(s)\n";

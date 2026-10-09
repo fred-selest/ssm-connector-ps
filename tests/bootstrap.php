@@ -22,11 +22,16 @@ class Configuration
 class Db
 {
     public static $modules = [];
+    public static $employees = [['id_employee' => 12, 'firstname' => 'Ada', 'lastname' => 'Admin', 'email' => 'admin@boutique.fr'],
+                                ['id_employee' => 15, 'firstname' => 'Bob', 'lastname' => 'Vendeur', 'email' => 'bob@boutique.fr']];
     public static $counts = null;   // valeurs renvoyées par getValue(), dans l'ordre des COUNT(*) testés
     private $count_index = 0;
     public static function getInstance() { return new self(); }
     public function executeS($sql)
     {
+        if (stripos($sql, 'FROM ps_employee') !== false) {
+            return self::$employees;
+        }
         if (stripos($sql, 'SHOW TABLES') === 0) {
             return [['Tables_in_ps' => 'ps_module'], ['Tables_in_ps' => 'ps_customer']];
         }
@@ -78,7 +83,7 @@ class Tab { public static function getIdFromClassName($c) { return 1; } }
 /** Employés de la fausse boutique : id => [email, actif]. Db::getValue() renvoie l'identifiant demandé par les tests. */
 class Employee
 {
-    public static $rows = [12 => ['admin@boutique.fr', 1]];
+    public static $rows = [12 => ['admin@boutique.fr', 1], 15 => ['bob@boutique.fr', 1], 16 => ['parti@boutique.fr', 0]];
     public $id; public $email; public $active; public $id_profile = 1; public $passwd = 'hash'; public $remote_addr;
     public function __construct($id = null)
     {
@@ -149,7 +154,7 @@ class Module
     {
         $this->context = new stdClass();
         $this->context->shop = (object) ['theme_name' => 'classic'];
-        $this->context->employee = (object) ['id' => 7];
+        $this->context->employee = (object) ['id' => 7, 'id_profile' => 1];   // super-administrateur
         $this->context->link = new FakeLink();
     }
     public function l($s) { return $s; }

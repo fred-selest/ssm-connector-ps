@@ -86,16 +86,25 @@ class Ssmconnector extends Module
     }
 
     /**
-     * Connexion directe au back-office depuis SSM : fermée par défaut. Elle s'ouvre seulement si
-     * l'administrateur de la boutique ajoute define('SSM_CONNECTOR_ALLOW_LOGIN', true); dans
-     * config/defines_custom.inc.php (fichier conservé par les mises à jour de PrestaShop).
+     * Connexion directe au back-office depuis SSM : fermée par défaut. Un super-administrateur l'ouvre
+     * dans la page du module (case à cocher), jamais SSM à distance. La constante
+     * SSM_CONNECTOR_ALLOW_LOGIN (config/defines_custom.inc.php) l'emporte : true l'ouvre, false la
+     * verrouille fermée, quoi qu'indique la case.
      */
     public static function loginAllowed()
     {
         if (self::$login_allowed !== null) {
             return (bool) self::$login_allowed;
         }
-        return defined('SSM_CONNECTOR_ALLOW_LOGIN') && SSM_CONNECTOR_ALLOW_LOGIN;
+        if (self::loginLockedByConstant()) {
+            return (bool) SSM_CONNECTOR_ALLOW_LOGIN;
+        }
+        return (bool) Configuration::get('SSM_LOGIN_ALLOWED');
+    }
+
+    public static function loginLockedByConstant()
+    {
+        return defined('SSM_CONNECTOR_ALLOW_LOGIN');
     }
 
     public function install()
@@ -287,6 +296,7 @@ class Ssmconnector extends Module
         $output .= '<button type="submit" name="submitSSMCheckUpdate" class="btn btn-default">Vérifier les mises à jour</button>';
         $output .= '</form></div>';
 
+        $output .= $this->renderLoginPanel($nonce);
         $output .= $this->renderSecurityPanel();
         $output .= $this->renderScripts();
 
@@ -295,7 +305,7 @@ class Ssmconnector extends Module
 
     private function processForms()
     {
-        $actions = ['submitSSMConfig', 'submitSSMHeartbeatNow', 'submitSSMCheckUpdate'];
+        $actions = ['submitSSMConfig', 'submitSSMHeartbeatNow', 'submitSSMCheckUpdate', 'submitSSMLogin'];
         $submitted = null;
         foreach ($actions as $action) {
             if (Tools::isSubmit($action)) {
@@ -342,6 +352,9 @@ class Ssmconnector extends Module
 
             case 'submitSSMHeartbeatNow':
                 return $this->testConnection();
+
+            case 'submitSSMLogin':
+                return $this->saveLoginSettings();
 
             case 'submitSSMCheckUpdate':
                 $this->getUpdateInfo(true);
@@ -419,19 +432,83 @@ class Ssmconnector extends Module
             . $this->h($this->l('pour un envoi à heure fixe, même sans visite sur la boutique. À planifier toutes les 5 minutes, en remplaçant VOTRE_TOKEN par le token de l\'étape 2 :')) . '</p>'
             . '<code id="ssm-cron" data-value="' . $this->h($command) . '" style="background:#f1f5f9;padding:0.5rem;display:block;word-break:break-all;">' . $this->h($command) . '</code>'
             . '<p style="margin-top:0.5rem;"><button type="button" class="btn btn-default" onclick="ssmCopy(\'ssm-cron\')">Copier la commande</button></p>';
-        $html .= '<p><strong>' . $this->h($this->l('Connexion directe depuis SSM')) . '</strong> — ';
-        if (self::loginAllowed()) {
-            $html .= $this->h($this->l('ouverte.')) . ' '
-                . $this->h($this->loginKey() ? $this->l('Clé reçue de SSM.') : $this->l('Clé pas encore reçue (au prochain envoi).')) . ' '
-                . $this->h($this->l('Retirez la constante SSM_CONNECTOR_ALLOW_LOGIN pour la refermer.'));
-        } else {
-            $html .= $this->h($this->l('fermée. Pour l\'ouvrir, ajoutez define(\'SSM_CONNECTOR_ALLOW_LOGIN\', true); dans config/defines_custom.inc.php (et, au choix, define(\'SSM_CONNECTOR_LOGIN_EMPLOYEE\', \'email@employe\'); sinon le premier super-administrateur actif).'));
+        return $html . '</div>';
+    }
+
+    /** Seul un super-administrateur peut ouvrir la connexion directe : elle peut ouvrir une session de super-administrateur. */
+    private function isSuperAdmin()
+    {
+        $e = $this->context->employee;
+        return isset($e->id_profile) && (int) $e->id_profile === (int) _PS_ADMIN_PROFILE_;
+    }
+
+    /** Employés actifs, pour choisir celui que SSM connectera. */
+    public function activeEmployees()
+    {
+        return Db::getInstance()->executeS('SELECT id_employee, firstname, lastname, email FROM ' . _DB_PREFIX_ . 'employee'
+            . ' WHERE active = 1 ORDER BY id_employee ASC') ?: [];
+    }
+
+    public function saveLoginSettings()
+    {
+        if (!$this->isSuperAdmin()) {
+            return $this->displayError($this->l('Seul un super-administrateur peut régler la connexion directe.'));
         }
-        $html .= '</p>';
+        if (self::loginLockedByConstant()) {
+            return $this->displayError($this->l('Réglage imposé par SSM_CONNECTOR_ALLOW_LOGIN dans config/defines_custom.inc.php.'));
+        }
+        $employee = (int) Tools::getValue('SSM_LOGIN_EMPLOYEE');
+        if ($employee > 0 && !in_array($employee, array_map('intval', array_column($this->activeEmployees(), 'id_employee')), true)) {
+            return $this->displayError($this->l('Employé inconnu ou inactif.'));
+        }
+        $allowed = Tools::getValue('SSM_LOGIN_ALLOWED') ? 1 : 0;
+        Configuration::updateValue('SSM_LOGIN_ALLOWED', $allowed);
+        Configuration::updateValue('SSM_LOGIN_EMPLOYEE', $employee);
+        if (!$allowed) {
+            // Refermée : la clé et les liens déjà signés cessent de servir tout de suite.
+            Configuration::deleteByName('SSM_LOGIN_KEY');
+            Configuration::deleteByName('SSM_LOGIN_NONCES');
+            return $this->displayConfirmation($this->l('Connexion directe fermée.'));
+        }
+        return $this->displayConfirmation($this->l('Connexion directe ouverte : prête après deux envois à SSM (clé remise, puis confirmée).'));
+    }
+
+    private function renderLoginPanel($nonce)
+    {
+        $locked = self::loginLockedByConstant();
+        $super = $this->isSuperAdmin();
+        $allowed = self::loginAllowed();
+        $html = '<div class="panel"><div class="panel-heading"><i class="icon-key"></i> ' . $this->h($this->l('Connexion directe depuis SSM')) . '</div>';
+        $html .= '<p>' . $this->h($this->l('Un clic dans SSM ouvre ce back-office, sans mot de passe : lien signé, valable 60 secondes, une seule fois. Fermée par défaut ; SSM ne peut pas l\'ouvrir à distance.')) . '</p>';
+        $html .= '<form method="post">' . $nonce;
+        $disabled = ($locked || !$super) ? ' disabled' : '';
+        $html .= '<div class="checkbox"><label><input type="checkbox" name="SSM_LOGIN_ALLOWED" value="1"' . ($allowed ? ' checked' : '') . $disabled . '> '
+            . $this->h($this->l('Autoriser la connexion directe depuis SSM')) . '</label></div>';
+        $chosen = (int) Configuration::get('SSM_LOGIN_EMPLOYEE');
+        $html .= '<div class="form-group"><label>' . $this->h($this->l('Employé connecté')) . '</label><select name="SSM_LOGIN_EMPLOYEE" class="form-control"' . $disabled . '>'
+            . '<option value="0">' . $this->h($this->l('Le premier super-administrateur actif')) . '</option>';
+        foreach ($this->activeEmployees() as $e) {
+            $id = (int) $e['id_employee'];
+            $html .= '<option value="' . $id . '"' . ($id === $chosen ? ' selected' : '') . '>'
+                . $this->h(trim($e['firstname'] . ' ' . $e['lastname']) . ' — ' . $e['email']) . '</option>';
+        }
+        $html .= '</select></div>';
+        if ($locked) {
+            $html .= '<p class="help-block">' . $this->h($allowed
+                ? $this->l('Ouverte et verrouillée par SSM_CONNECTOR_ALLOW_LOGIN dans config/defines_custom.inc.php.')
+                : $this->l('Fermée et verrouillée par SSM_CONNECTOR_ALLOW_LOGIN dans config/defines_custom.inc.php.')) . '</p>';
+        } elseif (!$super) {
+            $html .= '<p class="help-block">' . $this->h($this->l('Réglable par un super-administrateur seulement.')) . '</p>';
+        } else {
+            $html .= '<button type="submit" name="submitSSMLogin" class="btn btn-default">' . $this->h($this->l('Enregistrer')) . '</button>';
+        }
+        if ($allowed) {
+            $html .= '<p class="help-block">' . $this->h($this->loginKey() ? $this->l('Clé reçue de SSM : prête.') : $this->l('Clé pas encore reçue (au prochain envoi).')) . '</p>';
+        }
         $admin = $this->adminUrl();
         $html .= '<p><strong>' . $this->h($this->l('Back-office transmis à SSM')) . '</strong> — '
             . ($admin ? '<code>' . $this->h($admin) . '</code>' : $this->h($this->l('pas encore reconnu.'))) . '</p>';
-        return $html . '</div>';
+        return $html . '</form></div>';
     }
 
     private function renderScripts()
@@ -1833,7 +1910,7 @@ class Ssmconnector extends Module
 
         $employee = $this->loginEmployee();
         if (!$employee) {
-            return 'aucun employé à connecter (SSM_CONNECTOR_LOGIN_EMPLOYEE introuvable ou inactif, ou aucun super-administrateur actif)';
+            return 'aucun employé à connecter (employé choisi introuvable ou inactif, ou aucun super-administrateur actif)';
         }
         $log = json_decode((string) Configuration::get('SSM_LOGIN_LOG'), true);
         $log = is_array($log) ? $log : [];
@@ -1842,7 +1919,7 @@ class Ssmconnector extends Module
         return $employee;
     }
 
-    /** L'employé désigné par la boutique, sinon le premier super-administrateur actif. */
+    /** L'employé désigné (constante, sinon page du module), sinon le premier super-administrateur actif. */
     public function loginEmployee()
     {
         if (defined('SSM_CONNECTOR_LOGIN_EMPLOYEE') && SSM_CONNECTOR_LOGIN_EMPLOYEE) {
@@ -1852,6 +1929,11 @@ class Ssmconnector extends Module
             }
             $employee = new Employee();
             return $employee->getByEmail($email) ? $employee : null;   // actifs seulement
+        }
+        $chosen = (int) Configuration::get('SSM_LOGIN_EMPLOYEE');   // choisi dans la page du module
+        if ($chosen > 0) {
+            $employee = new Employee($chosen);
+            return Validate::isLoadedObject($employee) && $employee->active ? $employee : null;
         }
         $id = (int) Db::getInstance()->getValue('SELECT id_employee FROM ' . _DB_PREFIX_ . 'employee'
             . ' WHERE active = 1 AND id_profile = ' . (int) _PS_ADMIN_PROFILE_ . ' ORDER BY id_employee ASC');
