@@ -8,6 +8,8 @@ Format inspiré de [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/), ver
 - **Connexion directe : prête dès l'enregistrement de la case.** Elle demandait deux envois à SSM (la clé remise,
   puis confirmée), soit jusqu'à deux heures. Enregistrer la case fait maintenant les deux envois tout de suite, et
   le message dit si elle est prête. La refermer prévient SSM aussitôt.
+- Journal de PHP sans rien de neuf : plus de `fread(…, 0)` (une `ValueError` en PHP 8, rattrapée mais qui laissait
+  le fichier ouvert).
 - **Nouvelle version annoncée à SSM tout de suite** après une mise à jour du module (`upgrade-0.8.1.php`), sans
   jamais faire échouer la mise à jour si SSM ne répond pas.
 

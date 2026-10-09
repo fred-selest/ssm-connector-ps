@@ -1528,12 +1528,16 @@ class Ssmconnector extends Module
         if ($offset < 0 || $offset > $size) {
             $offset = max(0, $size - self::LOG_READ_MAX);
         }
+        if ($size <= $offset) {
+            // Rien de neuf : fread(…, 0) lève une ValueError en PHP 8 (rattrapée, mais le fichier restait ouvert).
+            return;
+        }
         $fh = @fopen($path, 'rb');
         if (!$fh) {
             return;
         }
         fseek($fh, $offset);
-        $chunk = (string) fread($fh, min(self::LOG_READ_MAX, max(0, $size - $offset)));
+        $chunk = (string) fread($fh, min(self::LOG_READ_MAX, $size - $offset));
         fclose($fh);
         $end = strrpos($chunk, "\n");
         if ($end === false) {

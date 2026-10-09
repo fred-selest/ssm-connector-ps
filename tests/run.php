@@ -905,6 +905,9 @@ test("erreurs PHP : journal lu par morceaux, chemins relatifs", function () {
     $e = $m->takePhpErrors();
     same([$e[0]['level'], $e[0]['message'], $e[0]['file'], $e[0]['line']], ['fatal', 'Uncaught Error: x()', 'modules/a/a.php', 9], 'erreur lue');
     same($m->takePhpErrors(), [], 'rien de neuf ensuite');
+    $before = file_get_contents($log);
+    $m->takePhpErrors();
+    same(file_get_contents($log), $before, "rien de neuf : rien n'est écrit dans le journal (plus de fread de 0 octet)");
     ini_restore('error_log');
 });
 
