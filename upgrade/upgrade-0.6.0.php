@@ -13,8 +13,10 @@ if (!defined('_PS_VERSION_')) {
     exit;
 }
 
-if (version_compare(_PS_VERSION_, '1.5', '<=')) {
-    return;
+// PrestaShop appelle upgrade_module_<version>() : sans cette fonction, le script n'était pas
+// appliqué comme une mise à niveau (les scripts 0.3.0 à 0.5.0 la définissent déjà).
+function upgrade_module_0_6_0($module)
+{
+    Configuration::updateValue('SSM_UPDATE_RESULTS', '');
+    return true;
 }
-
-Configuration::updateValue('SSM_UPDATE_RESULTS', '');

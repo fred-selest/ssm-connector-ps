@@ -4,7 +4,7 @@
  *
  * @author  Selest Informatique
  * @license MIT
- * @version 0.6.0
+ * @version 0.7.0
  */
 
 if (!defined('_PS_VERSION_')) {
@@ -36,20 +36,45 @@ class Ssmconnector extends Module
      * inscriptible sans cette couture.
      */
     public static $disk_check = null;
+    /** Coutures de test : dépôt d'une archive de sauvegarde. */
+    public static $uploader = null;
+    private static $shutdown_registered = false;
     const UPDATE_TTL = 43200;
+    const BACKUP_TMP = 'ssm-backup-tmp';
+    const PHP_ERRORS_MAX = 100;
+    const LOG_READ_MAX = 524288;
 
     public function __construct()
     {
         $this->name = 'ssmconnector';
         $this->tab = 'administration';
-        $this->version = '0.6.0';
+        $this->version = '0.7.0';
         $this->author = 'Selest Informatique';
         $this->need_instance = 0;
         $this->ps_versions_compliancy = ['min' => '8.0.0', 'max' => _PS_VERSION_];
         $this->bootstrap = true;
         parent::__construct();
         $this->displayName = $this->l('SSM Connector');
-        $this->description = $this->l('Connecteur SSM (Selest Site Manager) : envoie l\'inventaire de la boutique à SSM Core, sans rien modifier.');
+        $this->description = $this->l('Connecteur SSM (Selest Site Manager) : envoie l\'inventaire de la boutique à SSM Core et exécute ce que SSM demande.');
+        // Erreurs fatales : relevées en fin de requête, une seule fois par processus.
+        if (!self::$shutdown_registered) {
+            self::$shutdown_registered = true;
+            register_shutdown_function([$this, 'captureFatal']);
+        }
+    }
+
+    /** Ce que ce module sait exécuter : SSM n'envoie rien d'autre (contrat 3 de SSM Core 2.13). */
+    public function capabilities()
+    {
+        // `update_extension` n'est PAS annoncé : la mise à jour passe par $module->upgrade(), qui
+        // n'existe pas dans la classe Module de PrestaShop (seulement dans le faux module des
+        // tests) ; elle échouerait toujours. SSM n'enverra donc plus de mise à jour de module
+        // tant qu'un téléchargement de la nouvelle version (Addons) n'est pas écrit.
+        $caps = ['plugin_activate', 'plugin_deactivate', 'php_errors'];
+        if (class_exists('ZipArchive') && function_exists('curl_init')) {
+            $caps[] = 'backup_site';
+        }
+        return $caps;
     }
 
     public function install()
@@ -64,6 +89,7 @@ class Ssmconnector extends Module
             'SSM_SSM_URL', 'SSM_HEARTBEAT_INTERVAL', 'SSM_AUTO_HEARTBEAT', 'SSM_LAST_HEARTBEAT_AT',
             'SSM_HEARTBEAT_OK', 'SSM_LAST_ERROR', 'SSM_HEARTBEAT_LOCK', 'SSM_CONNECTOR_TOKEN',
             'SSM_PENDING_EVENTS', 'SSM_SEND_EVENTS', 'SSM_UPDATE_CACHE', 'SSM_CRON_FAILS', 'SSM_SITE_ID',
+            'SSM_UPDATE_RESULTS', 'SSM_COMMAND_RESULTS', 'SSM_PHP_ERRORS', 'SSM_LOG_OFFSET',
         ] as $key) {
             Configuration::deleteByName($key);
         }
@@ -701,6 +727,11 @@ class Ssmconnector extends Module
             'connector_update_available' => (bool) $update['available'],
             // comptes rendus des commandes exécutées au heartbeat précédent
             'results' => $this->takePendingResults(),
+            // contrat 3 (SSM Core 2.13) : ignorés sans dommage par un SSM plus ancien
+            'capabilities' => $this->capabilities(),
+            'command_results' => $this->takeCommandResults(),
+            'php_errors' => $this->takePhpErrors(),
+            'login_enabled' => false,
             // compteurs métier, lus par SSM Core depuis la 2.7.0
             'stats' => $stats,
             // informatifs (conservés, pas encore lus)
@@ -1024,12 +1055,353 @@ class Ssmconnector extends Module
             if (!is_array($cmd) || !isset($cmd['id'])) {
                 continue;
             }
+            $is_action = isset($cmd['ref']) && $cmd['ref'] === 'command';
             try {
-                $this->applyCommand($cmd);
+                if ($is_action) {
+                    $this->applyAction((int) $cmd['id'], isset($cmd['kind']) ? (string) $cmd['kind'] : '', $cmd);
+                } else {
+                    $this->applyCommand($cmd);
+                }
             } catch (\Throwable $e) {
-                $this->queueResult($cmd['id'], 'failed', $e->getMessage());
+                if ($is_action) {
+                    $this->queueCommandResult($cmd['id'], 'failed', $e->getMessage());
+                } else {
+                    $this->queueResult($cmd['id'], 'failed', $e->getMessage());
+                }
             }
         }
+    }
+
+    // === Actions (contrat 3) : activer / désactiver un module, sauvegarder la boutique ===
+
+    public function takeCommandResults()
+    {
+        $r = Configuration::get('SSM_COMMAND_RESULTS');
+        $r = is_string($r) ? json_decode($r, true) : $r;
+        if (!is_array($r)) {
+            return [];
+        }
+        Configuration::updateValue('SSM_COMMAND_RESULTS', '');
+        return array_slice($r, 0, 200);
+    }
+
+    public function queueCommandResult($command_id, $status, $error = null, $data = null)
+    {
+        $r = Configuration::get('SSM_COMMAND_RESULTS');
+        $r = is_string($r) ? json_decode($r, true) : $r;
+        if (!is_array($r)) {
+            $r = [];
+        }
+        $entry = ['command_id' => (int) $command_id, 'status' => $status === 'success' ? 'success' : 'failed'];
+        if ($error !== null && $error !== '') {
+            $entry['error'] = $this->cut((string) $error, 500);
+        }
+        if (is_array($data)) {
+            $entry['data'] = $data;
+        }
+        $r[] = $entry;
+        Configuration::updateValue('SSM_COMMAND_RESULTS', json_encode(array_slice($r, -200)));
+    }
+
+    private function applyAction($id, $kind, $cmd)
+    {
+        $params = isset($cmd['params']) && is_array($cmd['params']) ? $cmd['params'] : [];
+        if ($kind === 'backup_site') {
+            $this->backupShop($id, $params);
+            return;
+        }
+        if ($kind !== 'plugin_activate' && $kind !== 'plugin_deactivate') {
+            $this->queueCommandResult($id, 'failed', 'Action inconnue : ' . $kind);
+            return;
+        }
+        $slug = isset($cmd['slug']) ? (string) $cmd['slug'] : '';
+        if (!preg_match('/^[a-z0-9][a-z0-9._-]*$/i', $slug)) {
+            $this->queueCommandResult($id, 'failed', 'Nom de module refusé : ' . $slug);
+            return;
+        }
+        if ($slug === $this->name) {
+            $this->queueCommandResult($id, 'failed', 'Le connecteur ne se désactive pas lui-même.');
+            return;
+        }
+        $module = $this->findModule($slug);
+        if ($module === null) {
+            $this->queueCommandResult($id, 'failed', 'Module « ' . $slug . ' » introuvable sur cette boutique.');
+            return;
+        }
+        $ok = $kind === 'plugin_activate' ? $module->enable() : $module->disable();
+        $this->queueCommandResult($id, $ok ? 'success' : 'failed', $ok ? null : 'PrestaShop a refusé l\'opération.');
+    }
+
+    /**
+     * Exporte la base (database.sql) et les fichiers de la boutique (sans caches ni journaux, images
+     * en option) dans une archive zip déposée sur l'URL pré-signée fournie par SSM. Le dossier de
+     * travail est protégé et toujours vidé.
+     */
+    private function backupShop($id, $params)
+    {
+        $url = isset($params['upload_url']) ? (string) $params['upload_url'] : '';
+        $max = isset($params['max_bytes']) ? (int) $params['max_bytes'] : 5368709120;
+        $images = !isset($params['include_uploads']) || $params['include_uploads'];
+        if (strpos($url, 'https://') !== 0 && strpos($url, 'http://') !== 0) {
+            $this->queueCommandResult($id, 'failed', 'Adresse de dépôt invalide.');
+            return;
+        }
+        if (!class_exists('ZipArchive')) {
+            $this->queueCommandResult($id, 'failed', "L'extension PHP zip est requise pour sauvegarder.");
+            return;
+        }
+        @set_time_limit(0);
+        @ignore_user_abort(true);
+        $root = rtrim(_PS_ROOT_DIR_, '/');
+        $dir = $root . '/' . self::BACKUP_TMP;
+        $this->removeTree($dir);
+        if (!@mkdir($dir, 0700, true) && !is_dir($dir)) {
+            $this->queueCommandResult($id, 'failed', 'Dossier de travail impossible à créer.');
+            return;
+        }
+        @file_put_contents($dir . '/index.php', "<?php\nheader('HTTP/1.1 403 Forbidden');\nexit;\n");
+        @file_put_contents($dir . '/.htaccess', "Require all denied\nDeny from all\n");
+        try {
+            $tables = $this->dumpDatabase($dir . '/database.sql');
+            $zip_path = $dir . '/boutique.zip';
+            $zip = new ZipArchive();
+            if ($zip->open($zip_path, ZipArchive::CREATE | ZipArchive::OVERWRITE) !== true) {
+                throw new RuntimeException('Archive impossible à créer.');
+            }
+            $zip->addFile($dir . '/database.sql', 'database.sql');
+            $excludes = [self::BACKUP_TMP, self::BACKUP_DIR, 'var/cache', 'var/logs', 'cache/smarty', 'cache/cachefs', '.git'];
+            if (!$images) {
+                $excludes[] = 'img';
+            }
+            $files = $this->zipTree($zip, $root, 'boutique', $excludes);
+            $zip->close();
+            $size = (int) filesize($zip_path);
+            if ($size > $max) {
+                throw new RuntimeException('Archive de ' . round($size / 1048576) . ' Mo : au-delà de la limite de dépôt.');
+            }
+            $sha = hash_file('sha256', $zip_path);
+            $up = $this->upload($url, $zip_path, $size);
+            if (!$up['ok']) {
+                throw new RuntimeException('Dépôt refusé : ' . $up['error']);
+            }
+            $this->queueCommandResult($id, 'success', null, ['size_bytes' => $size, 'sha256' => $sha, 'files' => $files + 1, 'tables' => $tables]);
+        } catch (\Throwable $e) {
+            $this->queueCommandResult($id, 'failed', $e->getMessage());
+        } finally {
+            $this->removeTree($dir);
+        }
+    }
+
+    private function zipTree($zip, $root, $prefix, $excludes, $rel = '')
+    {
+        $count = 0;
+        $items = @scandir($root . ($rel !== '' ? '/' . $rel : ''));
+        if ($items === false) {
+            return 0;
+        }
+        foreach ($items as $item) {
+            if ($item === '.' || $item === '..') {
+                continue;
+            }
+            $path_rel = $rel !== '' ? $rel . '/' . $item : $item;
+            if (in_array($path_rel, $excludes, true)) {
+                continue;
+            }
+            $full = $root . '/' . $path_rel;
+            if (is_link($full)) {
+                continue;
+            }
+            if (is_dir($full)) {
+                $count += $this->zipTree($zip, $root, $prefix, $excludes, $path_rel);
+            } elseif (is_readable($full)) {
+                $zip->addFile($full, $prefix . '/' . $path_rel);
+                $count++;
+            }
+        }
+        return $count;
+    }
+
+    private static function sqlValue($v)
+    {
+        if ($v === null) {
+            return 'NULL';
+        }
+        return "'" . str_replace(["\\", "\0", "\n", "\r", "'", "\x1a"], ["\\\\", "\\0", "\\n", "\\r", "\\'", "\\Z"], (string) $v) . "'";
+    }
+
+    /** Export SQL des tables de la boutique (préfixe _DB_PREFIX_), par lots de 500 lignes. */
+    private function dumpDatabase($path)
+    {
+        $db = Db::getInstance();
+        $fh = fopen($path, 'wb');
+        if (!$fh) {
+            throw new RuntimeException('Export de la base impossible (écriture).');
+        }
+        fwrite($fh, '-- Export SSM Connector ' . $this->version . ' du ' . gmdate('Y-m-d H:i:s') . " UTC\nSET NAMES utf8mb4;\nSET foreign_key_checks = 0;\n\n");
+        $like = str_replace(['\\', '_', '%'], ['\\\\', '\\_', '\\%'], _DB_PREFIX_) . '%';
+        $n = 0;
+        foreach ((array) $db->executeS("SHOW TABLES LIKE '" . str_replace("'", "''", $like) . "'") as $row) {
+            $table = str_replace('`', '', (string) reset($row));
+            $create = $db->executeS('SHOW CREATE TABLE `' . $table . '`');
+            if (!$create || !isset($create[0]['Create Table'])) {
+                continue;
+            }
+            fwrite($fh, 'DROP TABLE IF EXISTS `' . $table . "`;\n" . $create[0]['Create Table'] . ";\n\n");
+            for ($offset = 0; ; $offset += 500) {
+                $rows = $db->executeS('SELECT * FROM `' . $table . '` LIMIT ' . $offset . ', 500');
+                if (!$rows) {
+                    break;
+                }
+                foreach ($rows as $r) {
+                    fwrite($fh, 'INSERT INTO `' . $table . '` VALUES (' . implode(',', array_map([__CLASS__, 'sqlValue'], array_values($r))) . ");\n");
+                }
+                if (count($rows) < 500) {
+                    break;
+                }
+            }
+            fwrite($fh, "\n");
+            $n++;
+        }
+        fwrite($fh, "SET foreign_key_checks = 1;\n");
+        fclose($fh);
+        return $n;
+    }
+
+    private function upload($url, $path, $size)
+    {
+        if (self::$uploader !== null) {
+            return call_user_func(self::$uploader, $url, $path, $size);
+        }
+        $fp = fopen($path, 'rb');
+        $ch = curl_init($url);
+        curl_setopt_array($ch, [
+            CURLOPT_UPLOAD => true, CURLOPT_INFILE => $fp, CURLOPT_INFILESIZE => $size,
+            CURLOPT_RETURNTRANSFER => true, CURLOPT_TIMEOUT => 3600, CURLOPT_FOLLOWLOCATION => false,
+            CURLOPT_PROTOCOLS => CURLPROTO_HTTP | CURLPROTO_HTTPS,
+            CURLOPT_HTTPHEADER => ['Content-Type: application/zip'],
+        ]);
+        $body = curl_exec($ch);
+        $code = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        $err = curl_error($ch);
+        curl_close($ch);
+        fclose($fp);
+        if ($body === false) {
+            return ['ok' => false, 'error' => 'réseau : ' . $err];
+        }
+        return $code >= 200 && $code < 300 ? ['ok' => true, 'error' => null]
+            : ['ok' => false, 'error' => 'HTTP ' . $code . ' ' . $this->cut(strip_tags((string) $body), 160)];
+    }
+
+    // === Erreurs PHP ===
+
+    private function relativePath($text)
+    {
+        $root = rtrim(_PS_ROOT_DIR_, '/') . '/';
+        return str_replace([$root, (string) realpath($root) . '/'], '', (string) $text);
+    }
+
+    public function captureFatal()
+    {
+        $e = error_get_last();
+        if (!is_array($e) || !in_array($e['type'], [E_ERROR, E_PARSE, E_CORE_ERROR, E_COMPILE_ERROR, E_USER_ERROR], true)) {
+            return;
+        }
+        if ($this->errorLogPath() !== null) {
+            return;   // déjà écrite dans le journal de PHP, lu au heartbeat
+        }
+        try {
+            $this->recordPhpError($e['type'] === E_PARSE ? 'parse' : 'fatal', $e['message'], $e['file'], $e['line']);
+        } catch (\Throwable $x) {
+            // la base elle-même peut être la cause
+        }
+    }
+
+    public function recordPhpError($level, $message, $file, $line, $count = 1, $when = null)
+    {
+        $all = json_decode((string) Configuration::get('SSM_PHP_ERRORS'), true);
+        if (!is_array($all)) {
+            $all = [];
+        }
+        $message = (string) strtok((string) $message, "\n");
+        if (preg_match('/^(.*) in (\S+?)(?: on line (\d+)|:(\d+))\s*$/', $message, $f)) {
+            $message = $f[1];
+            if ($file === null) {
+                $file = $f[2];
+                $line = (int) ($f[3] !== '' ? $f[3] : $f[4]);
+            }
+        }
+        $message = $this->cut($this->relativePath($message), 1000);
+        $file = $file !== null ? $this->cut($this->relativePath($file), 300) : null;
+        $key = md5($level . '|' . $message . '|' . $file . '|' . $line);
+        $at = gmdate('c', $when ?: time());
+        if (isset($all[$key])) {
+            $all[$key]['count'] += $count;
+            $all[$key]['last_seen'] = $at;
+        } elseif (count($all) < self::PHP_ERRORS_MAX) {
+            $all[$key] = ['level' => $level, 'message' => $message !== '' ? $message : '(sans message)', 'file' => $file,
+                          'line' => $line !== null ? (int) $line : null, 'count' => $count, 'last_seen' => $at];
+        } else {
+            return;
+        }
+        Configuration::updateValue('SSM_PHP_ERRORS', json_encode($all));
+    }
+
+    public function errorLogPath()
+    {
+        $p = ini_get('error_log');
+        return ($p && is_string($p) && is_file($p) && is_readable($p)) ? $p : null;
+    }
+
+    public function readErrorLog()
+    {
+        $path = $this->errorLogPath();
+        if ($path === null) {
+            return;
+        }
+        clearstatcache(true, $path);
+        $size = (int) filesize($path);
+        $offset = Configuration::get('SSM_LOG_OFFSET');
+        $offset = $offset === false || $offset === '' ? -1 : (int) $offset;
+        if ($offset < 0 || $offset > $size) {
+            $offset = max(0, $size - self::LOG_READ_MAX);
+        }
+        $fh = @fopen($path, 'rb');
+        if (!$fh) {
+            return;
+        }
+        fseek($fh, $offset);
+        $chunk = (string) fread($fh, min(self::LOG_READ_MAX, max(0, $size - $offset)));
+        fclose($fh);
+        $end = strrpos($chunk, "\n");
+        if ($end === false) {
+            return;
+        }
+        $chunk = substr($chunk, 0, $end + 1);
+        Configuration::updateValue('SSM_LOG_OFFSET', $offset + strlen($chunk));
+        $levels = ['fatal error' => 'fatal', 'catchable fatal error' => 'fatal', 'recoverable fatal error' => 'fatal',
+                   'parse error' => 'parse', 'warning' => 'warning', 'notice' => 'notice', 'deprecated' => 'deprecated'];
+        foreach (explode("\n", $chunk) as $l) {
+            if (!preg_match('/^\[([^\]]+)\] PHP ([A-Za-z ]+?):\s+(.*)$/', $l, $m)) {
+                continue;
+            }
+            $level = isset($levels[strtolower($m[2])]) ? $levels[strtolower($m[2])] : null;
+            if ($level !== null) {
+                $ts = strtotime($m[1]);
+                $this->recordPhpError($level, $m[3], null, null, 1, $ts ?: null);
+            }
+        }
+    }
+
+    public function takePhpErrors()
+    {
+        try {
+            $this->readErrorLog();
+        } catch (\Throwable $e) {
+            // un journal illisible n'empêche pas le heartbeat
+        }
+        $all = json_decode((string) Configuration::get('SSM_PHP_ERRORS'), true);
+        Configuration::updateValue('SSM_PHP_ERRORS', '');
+        return is_array($all) ? array_slice(array_values($all), 0, self::PHP_ERRORS_MAX) : [];
     }
 
     private function applyCommand($cmd)

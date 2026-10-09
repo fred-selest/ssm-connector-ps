@@ -62,6 +62,20 @@ Pour un envoi à heure fixe, même sans visite, planifier toutes les 5 minutes (
 
 Le heartbeat n'est envoyé que si l'intervalle configuré est écoulé ; ajouter `?force=1` pour l'envoyer immédiatement. Le token se passe **uniquement dans l'en-tête** : il n'est plus accepté dans l'adresse (changement depuis la 0.3.0).
 
+## Ce que SSM peut demander (0.7.0)
+
+Rien n'est exécuté sans demande de SSM ; le compte rendu part au heartbeat suivant.
+
+| Demande | Ce que fait le module |
+|---|---|
+| activer, désactiver un module | `Module::enable()` / `disable()` ; jamais le connecteur lui-même |
+| sauvegarder la boutique | `database.sql` + fichiers (sans `var/cache`, `var/logs`, images en option) dans un zip déposé sur l'URL pré-signée du stockage S3 de l'agence |
+
+Le module remonte aussi les **erreurs PHP** (fatales, et celles du journal de PHP), chemins relatifs à la boutique.
+
+**Pas encore** : la mise à jour de modules (elle appelait une méthode qui n'existe pas dans PrestaShop et
+échouait toujours ; elle n'est plus annoncée à SSM), la connexion directe au back-office.
+
 ## Sécurité
 
 - **HTTPS obligatoire** : l'adresse de SSM Core doit commencer par `https://` (`http://` n'est toléré que pour `localhost` et `127.0.0.1`). Le certificat est vérifié et les redirections ne sont **pas** suivies, pour que le token ne parte jamais vers une autre adresse.
