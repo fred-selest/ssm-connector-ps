@@ -4,7 +4,7 @@
  *
  * @author  Selest Informatique
  * @license MIT
- * @version 0.9.0
+ * @version 0.10.0
  */
 
 if (!defined('_PS_VERSION_')) {
@@ -53,7 +53,7 @@ class Ssmconnector extends Module
     {
         $this->name = 'ssmconnector';
         $this->tab = 'administration';
-        $this->version = '0.9.0';
+        $this->version = '0.10.0';
         $this->author = 'Selest Informatique';
         $this->need_instance = 0;
         $this->ps_versions_compliancy = ['min' => '8.0.0', 'max' => _PS_VERSION_];
@@ -89,6 +89,15 @@ class Ssmconnector extends Module
         }
         if (defined('_PS_ROOT_DIR_') && is_dir(_PS_ROOT_DIR_) && is_writable(_PS_ROOT_DIR_)) {
             $caps[] = 'write_files';
+            $caps[] = 'copy_files';
+            $caps[] = 'upload_files';
+            $caps[] = 'extract_files';
+        }
+        // Le telechargement est une lecture : il ne demande pas d'ecriture sur le site, mais cURL
+        // pour deposer sur le point de sauvegarde.
+        if (defined('_PS_ROOT_DIR_') && is_dir(_PS_ROOT_DIR_) && is_readable(_PS_ROOT_DIR_)
+            && function_exists('curl_init')) {
+            $caps[] = 'download_files';
         }
         return $caps;
     }
@@ -194,7 +203,7 @@ class Ssmconnector extends Module
 
     // --- opérations ---
 
-    private function oplist_files($id, $params) {
+    private function opListFiles($id, $params) {
         try {
             $dir = $this->resolveSitePath(isset($params['path']) ? $params['path'] : '/');
         } catch (\RuntimeException $e) {
@@ -232,7 +241,7 @@ class Ssmconnector extends Module
         ]);
     }
 
-    private function opread_file($id, $params) {
+    private function opReadFile($id, $params) {
         try {
             $abs = $this->resolveSitePath(isset($params['path']) ? $params['path'] : '');
         } catch (\RuntimeException $e) {
@@ -267,7 +276,7 @@ class Ssmconnector extends Module
         ]);
     }
 
-    private function opwrite_file($id, $params) {
+    private function opWriteFile($id, $params) {
         try {
             $abs = $this->resolveSitePath(isset($params['path']) ? $params['path'] : '');
         } catch (\RuntimeException $e) {
@@ -315,7 +324,7 @@ class Ssmconnector extends Module
         ]);
     }
 
-    private function opmove_file($id, $params) {
+    private function opMoveFile($id, $params) {
         try {
             $abs = $this->resolveSitePath(isset($params['path']) ? $params['path'] : '');
             $vers = $this->resolveSitePath(isset($params['to']) ? $params['to'] : '');
@@ -345,7 +354,7 @@ class Ssmconnector extends Module
         $this->signalerErreurFichier($id, 'Deplacement impossible.');
     }
 
-    private function opdelete_file($id, $params) {
+    private function opDeleteFile($id, $params) {
         try {
             $abs = $this->resolveSitePath(isset($params['path']) ? $params['path'] : '');
         } catch (\RuntimeException $e) {
@@ -378,6 +387,322 @@ class Ssmconnector extends Module
         $this->signalerErreurFichier($id, 'Suppression impossible.');
     }
 
+// === Transfert de fichiers (SSM 2.27) : copier, telecharger, envoyer, decompresser ===
+
+    /**
+     * Copie cote serveur. Les octets ne quittent jamais le site : c'est la seule façon de copier un
+     * fichier de 200 Mo sans le faire transiter par une API.
+     */
+    private function opCopyFile($id, $params)
+    {
+        try {
+            $src = $this->resolveSitePath($params['path'] ?? '');
+            $dst = $this->resolveSitePath($params['to'] ?? '');
+        } catch (\RuntimeException $e) {
+            $this->signalerErreurFichier($id, $e->getMessage());
+            return;
+        }
+        if ($src === $dst) {
+            $this->signalerErreurFichier($id, 'La source et la destination sont identiques.');
+            return;
+        }
+        if (!file_exists($src)) {
+            $this->signalerErreurFichier($id, 'Source introuvable.');
+            return;
+        }
+        if (file_exists($dst) && empty($params['overwrite'])) {
+            $this->signalerErreurFichier($id, 'La destination existe deja.');
+            return;
+        }
+        $dossier = dirname($dst);
+        if (!$this->diskWritable($dossier)) {
+            $this->signalerErreurFichier($id, 'Dossier de destination non inscriptible.');
+            return;
+        }
+        if (is_dir($src)) {
+            if (!$this->copierDossier($src, $dst, !empty($params['overwrite']))) {
+                $this->signalerErreurFichier($id, 'Copie du dossier impossible.');
+                return;
+            }
+        } elseif (!@copy($src, $dst)) {
+            $this->signalerErreurFichier($id, 'Copie impossible.');
+            return;
+        }
+        @chmod($dst, @fileperms($src) & 0777);   // un script qui perd son bit executable ne se lance plus
+        $this->queueCommandResult($id, 'success', null, [
+            'path' => $this->relToRoot($src), 'to' => $this->relToRoot($dst),
+            'size_bytes' => (int) @filesize($dst), 'detail' => 'Copie effectuee sur le site.',
+        ]);
+    }
+
+    private function copierDossier($src, $dst, $ecraser)
+    {
+        if (!@mkdir($dst, 0777, true) && !is_dir($dst)) {
+            return false;
+        }
+        $handle = @opendir($src);
+        if ($handle === false) {
+            return false;
+        }
+        $ok = true;
+        while (($nom = readdir($handle)) !== false) {
+            if ($nom === '.' || $nom === '..') {
+                continue;
+            }
+            $de = $src . '/' . $nom;
+            $vers = $dst . '/' . $nom;
+            // Un membre d'archive, ou une copie, ne doit jamais pouvoir ressortir par un lien.
+            if (is_link($de)) {
+                continue;
+            }
+            if (is_dir($de)) {
+                $ok = $this->copierDossier($de, $vers, $ecraser) && $ok;
+            } else {
+                if (file_exists($vers) && !$ecraser) {
+                    continue;
+                }
+                $ok = @copy($de, $vers) && $ok;
+            }
+        }
+        closedir($handle);
+        return $ok;
+    }
+
+    /**
+     * Depose un fichier du site sur le point de sauvegarde, pour que SSM en serve une URL signee.
+     *
+     * Les octets ne passent pas par SSM : ils vont du site vers le stockage, puis du stockage vers
+     * le navigateur. C'est ce qui rend possible le telechargement d'un fichier de 200 Mo.
+     */
+    private function opDownloadFile($id, $params)
+    {
+        try {
+            $abs = $this->resolveSitePath($params['path'] ?? '');
+        } catch (\RuntimeException $e) {
+            $this->signalerErreurFichier($id, $e->getMessage());
+            return;
+        }
+        if (!is_file($abs)) {
+            $this->signalerErreurFichier($id, 'Fichier introuvable.');
+            return;
+        }
+        if ($this->isSecretFile($abs)) {
+            $this->signalerErreurFichier($id, "Ce fichier contient des identifiants : il n'est pas telechargeable.");
+            return;
+        }
+        $url = (string) ($params['upload_url'] ?? '');
+        $cle = (string) ($params['object_key'] ?? '');
+        if ($url === '' || $cle === '') {
+            $this->signalerErreurFichier($id, 'Aucune URL de depot fournie.');
+            return;
+        }
+        $taille = (int) filesize($abs);
+        if ($taille > 536870912) {   // 512 Mo
+            $this->signalerErreurFichier($id, 'Fichier trop volumineux pour le transfert (512 Mo maximum).');
+            return;
+        }
+        $contenu = @file_get_contents($abs);
+        if ($contenu === false) {
+            $this->signalerErreurFichier($id, 'Lecture impossible.');
+            return;
+        }
+        $http = $this->mettre($url, $contenu, 'application/octet-stream');
+        if (!empty($http['erreur'])) {
+            $this->signalerErreurFichier($id, "Depot refuse : " . $http['erreur']);
+            return;
+        }
+        // On ne repond « depose » qu'apres l'envoi reel : c'est cet avis que SSM transforme en URL
+        // de telechargement. Un lien vers un fichier que personne n'a depose ne doit pas exister.
+        $this->queueCommandResult($id, 'success', null, [
+            'depose' => true, 'object_key' => $cle, 'size_bytes' => $taille,
+            'sha256' => hash('sha256', $contenu),
+            'detail' => 'Depot sur le point de sauvegarde : ' . $this->humanSize($taille),
+        ]);
+    }
+
+    /**
+     * Recupere un fichier que l'utilisateur a depose et l'installe sur le site, en le
+     * decompressant si c'est une archive.
+     *
+     * Chaque membre d'une archive est verifie avant extraction : un zip telecharge sur internet
+     * contient parfois `../../parameters.php`, et une extraction non verifiee ecrirait n'importe ou
+     * sur le serveur.
+     */
+    private function opInstallFile($id, $params)
+    {
+        $url = (string) ($params['download_url'] ?? '');
+        if ($url === '') {
+            $this->signalerErreurFichier($id, 'Aucune URL de telechargement fournie.');
+            return;
+        }
+        $reponse = $this->telechargerFichier($url);
+        if ($reponse === false) {
+            $this->signalerErreurFichier($id, 'Recuperation du fichier impossible.');
+            return;
+        }
+        $nom = basename((string) ($params['name'] ?? 'fichier'));
+        $nom = preg_replace('/[^A-Za-z0-9._\-]/', '_', $nom);
+        if (!empty($params['sha256']) && hash('sha256', $reponse) !== $params['sha256']) {
+            $this->signalerErreurFichier($id, 'Empreinte du fichier recu differente de celle annoncee.');
+            return;
+        }
+        $dossier = $this->resolveSitePath($params['path'] ?? '/');
+        if (!is_dir($dossier)) {
+            if (!$this->diskWritable(dirname($dossier)) || !@mkdir($dossier, 0777, true)) {
+                $this->signalerErreurFichier($id, 'Dossier de destination impossible a creer.');
+                return;
+            }
+        }
+        $cible = rtrim($dossier, '/') . '/' . $nom;
+        if (file_exists($cible) && empty($params['overwrite'])) {
+            $this->signalerErreurFichier($id, 'Le fichier existe deja : refus de le remplacer.');
+            return;
+        }
+        if (!$this->diskWritable($dossier)) {
+            $this->signalerErreurFichier($id, 'Dossier non inscriptible.');
+            return;
+        }
+        if (@file_put_contents($cible, $reponse, LOCK_EX) === false) {
+            $this->signalerErreurFichier($id, 'Ecriture impossible.');
+            return;
+        }
+        $res = ['path' => $this->relToRoot($cible), 'size_bytes' => strlen($reponse)];
+        if (!empty($params['extract']) && preg_match('/\.zip$/i', $nom)) {
+            $extrait = $this->extraireZip($cible, $dossier, !empty($params['overwrite']));
+            $res['extraction'] = $extrait;
+            if (isset($extrait['erreur'])) {
+                $this->signalerErreurFichier($id, 'Fichier installe, mais decompression refusee : ' . $extrait['erreur']);
+                return;
+            }
+            $res['detail'] = 'Archive installee et decompressee (' . $extrait['fichiers'] . ' fichier(s)).';
+        } else {
+            $res['detail'] = 'Fichier installe (' . $this->humanSize(strlen($reponse)) . ').';
+        }
+        $this->queueCommandResult($id, 'success', null, $res);
+    }
+
+    private function opExtractArchive($id, $params)
+    {
+        try {
+            $abs = $this->resolveSitePath($params['path'] ?? '');
+        } catch (\RuntimeException $e) {
+            $this->signalerErreurFichier($id, $e->getMessage());
+            return;
+        }
+        if (!is_file($abs) || !preg_match('/\.zip$/i', $abs)) {
+            $this->signalerErreurFichier($id, 'Archive zip introuvable.');
+            return;
+        }
+        $dossier = dirname($abs);
+        $res = $this->extraireZip($abs, $dossier, !empty($params['overwrite']));
+        if (isset($res['erreur'])) {
+            $this->signalerErreurFichier($id, 'Decompression refusee : ' . $res['erreur']);
+            return;
+        }
+        $this->queueCommandResult($id, 'success', null, [
+            'path' => $this->relToRoot($abs), 'fichiers' => $res['fichiers'],
+            'detail' => $res['fichiers'] . ' fichier(s) decompresse(s).',
+        ]);
+    }
+
+    /**
+     * Extraction sure : chaque membre est resolu, et refuse s'il sort de la racine du site.
+     * `ZipArchive::extractTo()` ne fait pas ce controle — c'est a nous de le faire.
+     */
+    private function extraireZip($zip, $dossier, $ecraser)
+    {
+        if (!class_exists('ZipArchive')) {
+            return ['erreur' => "l'extension ZipArchive n'est pas installee sur ce serveur."];
+        }
+        $racine = rtrim($this->file_root(), '/\\');
+        $z = new \ZipArchive();
+        if ($z->open($zip) !== true) {
+            return ['erreur' => 'archive illisible ou corrompue.'];
+        }
+        $n = 0;
+        for ($i = 0; $i < $z->numFiles; $i++) {
+            $membre = $z->getNameIndex($i);
+            if ($membre === false || substr($membre, -1) === '/') {
+                continue;
+            }
+            // Resolution complete : c'est elle qui detecte `../` et un lien symbolique prealable.
+            $reel = realpath($dossier . '/' . $membre);
+            if ($reel === false) {
+                $reel = realpath(dirname($dossier . '/' . $membre));
+                $reel = $reel === false ? false : $reel . DIRECTORY_SEPARATOR . basename($membre);
+            }
+            if ($reel === false || (rtrim($reel, '/\\') !== $racine
+                                   && strpos(rtrim($reel, '/\\'), $racine . DIRECTORY_SEPARATOR) !== 0)) {
+                $z->close();
+                return ['erreur' => 'un membre sort de la racine du site : ' . $this->cut($membre, 80)];
+            }
+            $contenu = $z->getFromIndex($i);
+            if ($contenu === false) {
+                continue;
+            }
+            if (file_exists($reel) && !$ecraser) {
+                continue;
+            }
+            $sous = dirname($reel);
+            if (!is_dir($sous) && !@mkdir($sous, 0777, true)) {
+                $z->close();
+                return ['erreur' => 'dossier impossible a creer : ' . $this->cut(dirname($membre), 80)];
+            }
+            if (@file_put_contents($reel, $contenu, LOCK_EX) !== false) {
+                $n++;
+            }
+        }
+        $z->close();
+        return ['fichiers' => $n];
+    }
+
+    // --- transfers HTTP bruts (S3-compatible) ---
+
+    private function mettre($url, $corps, $type)
+    {
+        if (!function_exists('curl_init')) {
+            return ['erreur' => 'cURL absent de ce serveur.'];
+        }
+        $ch = curl_init($url);
+        curl_setopt_array($ch, [
+            CURLOPT_PUT => true,
+            CURLOPT_INFILE => fopen('php://temp', 'r+'),
+            CURLOPT_INFILESIZE => strlen($corps),
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_HTTPHEADER => ['Content-Type: ' . $type, 'Content-Length: ' . strlen($corps)],
+            CURLOPT_TIMEOUT => 120,
+        ]);
+        curl_setopt($ch, CURLOPT_INFILE, $this->tempStream($corps));
+        $reponse = curl_exec($ch);
+        $code = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        $erreur = curl_error($ch);
+        curl_close($ch);
+        if ($reponse === false || ($code < 200 && $code != 0) || $erreur) {
+            return ['erreur' => $this->cut($erreur !== '' ? $erreur : 'HTTP ' . $code, 200)];
+        }
+        return [];
+    }
+
+    private function temp_stream($corps)
+    {
+        $h = fopen('php://temp', 'r+');
+        fwrite($h, $corps);
+        rewind($h);
+        return $h;
+    }
+
+    private function telecharger($url)
+    {
+        if (!function_exists('curl_init')) {
+            return false;
+        }
+        $ch = curl_init($url);
+        curl_setopt_array($ch, [CURLOPT_RETURNTRANSFER => true, CURLOPT_FOLLOWLOCATION => true,
+            CURLOPT_TIMEOUT => 180]);
+        $reponse = curl_exec($ch);
+        curl_close($ch);
+        return $reponse === false ? false : $reponse;
+    }
 
     /**
      * Connexion directe au back-office depuis SSM : fermée par défaut. Un super-administrateur l'ouvre
@@ -1570,12 +1895,15 @@ class Ssmconnector extends Module
         $fichierOps = [
             'list_files' => 'opListFiles', 'read_file' => 'opReadFile',
             'write_file' => 'opWriteFile', 'move_file' => 'opMoveFile',
-            'delete_file' => 'opDeleteFile',
+            'delete_file' => 'opDeleteFile', 'copy_file' => 'opCopyFile',
+            'download_file' => 'opDownloadFile', 'install_file' => 'opInstallFile',
+            'extract_archive' => 'opExtractArchive',
         ];
         if (isset($fichierOps[$kind])) {
             // Garde independante de celle de SSM : meme si une demande passe, un connecteur qui
             // n'annonce pas write_files refuse d'ecrire.
-            if (in_array($kind, ['write_file', 'move_file', 'delete_file'], true)
+            if (in_array($kind, ['write_file', 'move_file', 'delete_file', 'copy_file',
+                                 'install_file', 'extract_archive'], true)
                 && !in_array('write_files', $this->capabilities(), true)) {
                 $this->queueCommandResult($id, 'failed', "Ce connecteur n'annonce pas write_files.");
                 return;
