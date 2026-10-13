@@ -4,7 +4,7 @@
  *
  * @author  Selest Informatique
  * @license MIT
- * @version 0.8.1
+ * @version 0.9.0
  */
 
 if (!defined('_PS_VERSION_')) {
@@ -53,7 +53,7 @@ class Ssmconnector extends Module
     {
         $this->name = 'ssmconnector';
         $this->tab = 'administration';
-        $this->version = '0.8.1';
+        $this->version = '0.9.0';
         $this->author = 'Selest Informatique';
         $this->need_instance = 0;
         $this->ps_versions_compliancy = ['min' => '8.0.0', 'max' => _PS_VERSION_];
@@ -82,8 +82,302 @@ class Ssmconnector extends Module
         if (self::loginAllowed()) {
             $caps[] = 'login';
         }
+        // Explorateur de fichiers (SSM 2.27). Annoncees separement : lire un `log` ne doit pas
+        // obliger a ouvrir le droit d'ecrire sur des fichiers de production.
+        if (defined('_PS_ROOT_DIR_') && is_dir(_PS_ROOT_DIR_) && is_readable(_PS_ROOT_DIR_)) {
+            $caps[] = 'read_files';
+        }
+        if (defined('_PS_ROOT_DIR_') && is_dir(_PS_ROOT_DIR_) && is_writable(_PS_ROOT_DIR_)) {
+            $caps[] = 'write_files';
+        }
         return $caps;
     }
+
+    // === Explorateur de fichiers (SSM 2.27) ===
+    private function fileRoot() {
+        $root = @realpath(_PS_ROOT_DIR_);
+        return $root === false ? rtrim(_PS_ROOT_DIR_, '/\\') : $root;
+    }
+
+    private function resolveSitePath($raw) {
+        if (!is_string($raw) || $raw === '') {
+            throw new \RuntimeException('Chemin absent.');
+        }
+        if (strpos($raw, "\0") !== false || preg_match('/[\r\n\t]/', $raw)) {
+            throw new \RuntimeException('Chemin invalide.');
+        }
+        $rel = str_replace('\\', '/', trim($raw));
+        $rel = ltrim($rel, '/');
+        $segs = [];
+        foreach (explode('/', $rel) as $seg) {
+            if ($seg === '' || $seg === '.') {
+                continue;
+            }
+            if ($seg === '..') {
+                // Refuse franchement plutot que de normaliser. Un `../` qui deborde la racine
+                // exprime une demande de sortir du site : la reduire silencieusement a la racine
+                // eviterait un echec, mais elle validerait une requete qui n'a pas de sens.
+                if (!$segs) {
+                    throw new \RuntimeException("Chemin refuse : la remontee sort de la racine du site.");
+                }
+                array_pop($segs);
+                continue;
+            }
+            if (!preg_match('/^[A-Za-z0-9._\-]+$/', $seg)) {
+                throw new \RuntimeException('Segment de chemin refuse : ' . $this->cut($seg, 40));
+            }
+            $segs[] = $seg;
+        }
+        $root = $this->fileRoot();
+        if (!$segs) {
+            return $root;
+        }
+        $candidat = $root . '/' . implode('/', $segs);
+        // Si le chemin existe deja, on resout reellement (liens symboliques) ; sinon on resout le
+        // parent, pour qu'un fichier cree dans un dossier symlinke ne sorte pas non plus.
+        $reel = realpath($candidat);
+        if ($reel === false) {
+            $reel = realpath(dirname($candidat));
+        }
+        if ($reel !== false) {
+            $reel = rtrim($reel, '/\\');
+            if ($reel !== $root && strpos($reel, $root . DIRECTORY_SEPARATOR) !== 0) {
+                throw new \RuntimeException('Chemin refuse : il sort de la racine du site.');
+            }
+        }
+        return $candidat;
+    }
+
+    /** Un fichier d'identifiants n'est ni lu ni ecrit depuis SSM : les afficher les copierait dans
+     *  une page web, et les ecrire a l'aveugle casse le site. */
+    private function isSecretFile($abs) {
+        $base = basename($abs);
+        if (in_array($base, ['.htaccess', '.env', 'web.config', 'parameters.php', 'config/settings.inc.php'], true)) {
+            return true;
+        }
+        return strpos($abs, DIRECTORY_SEPARATOR . 'config' . DIRECTORY_SEPARATOR . 'settings.inc.php') !== false;
+    }
+
+    private function humanSize($bytes) {
+        $bytes = (int) $bytes;
+        if ($bytes < 1024) {
+            return $bytes . ' o';
+        }
+        if ($bytes < 1048576) {
+            return round($bytes / 1024, 1) . ' Ko';
+        }
+        return round($bytes / 1048576, 1) . ' Mo';
+    }
+
+    private function relToRoot($abs) {
+        $rootn = str_replace('\\', '/', rtrim($this->fileRoot(), '/\\') . '/');
+        $absn = str_replace('\\', '/', $abs);
+        return strpos($absn, $rootn) === 0 ? '/' . ltrim(substr($absn, strlen($rootn)), '/') : $absn;
+    }
+
+    private function fileEntry($abs) {
+        $est_dossier = is_dir($abs);
+        return [
+            'nom' => basename($abs),
+            'chemin' => $this->relToRoot($abs),
+            'dossier' => $est_dossier,
+            'taille' => $est_dossier ? 0 : (int) @filesize($abs),
+            'taille_lisible' => $est_dossier ? '—' : $this->humanSize(@filesize($abs)),
+            'modifie' => (int) @filemtime($abs),
+            'secret' => !$est_dossier && $this->isSecretFile($abs),
+        ];
+    }
+
+    private function signalerErreurFichier($id, $raison) {
+        $this->queueCommandResult($id, 'failed', $raison);
+    }
+
+    // --- opérations ---
+
+    private function oplist_files($id, $params) {
+        try {
+            $dir = $this->resolveSitePath(isset($params['path']) ? $params['path'] : '/');
+        } catch (\RuntimeException $e) {
+            $this->signalerErreurFichier($id, $e->getMessage());
+            return;
+        }
+        if (!is_dir($dir)) {
+            $this->signalerErreurFichier($id, "Ce chemin n'est pas un dossier.");
+            return;
+        }
+        $entrees = [];
+        $handle = @opendir($dir);
+        if ($handle === false) {
+            $this->signalerErreurFichier($id, 'Dossier illisible.');
+            return;
+        }
+        while (($nom = readdir($handle)) !== false) {
+            if ($nom === '.' || $nom === '..') {
+                continue;
+            }
+            $entrees[] = $this->fileEntry($dir . '/' . $nom);
+        }
+        closedir($handle);
+        usort($entrees, function ($a, $b) {
+            if ($a['dossier'] !== $b['dossier']) {
+                return $a['dossier'] ? -1 : 1;    // les dossiers d'abord : c'est ce qu'on cherche
+            }
+            return strcasecmp($a['nom'], $b['nom']);
+        });
+        $this->queueCommandResult($id, 'success', null, [
+            'path' => $this->relToRoot($dir),
+            'racine' => $this->relToRoot($this->fileRoot()),
+            'entrees' => array_slice($entrees, 0, 500),
+            'tronque' => count($entrees) > 500,
+        ]);
+    }
+
+    private function opread_file($id, $params) {
+        try {
+            $abs = $this->resolveSitePath(isset($params['path']) ? $params['path'] : '');
+        } catch (\RuntimeException $e) {
+            $this->signalerErreurFichier($id, $e->getMessage());
+            return;
+        }
+        if (!is_file($abs)) {
+            $this->signalerErreurFichier($id, 'Fichier introuvable.');
+            return;
+        }
+        if ($this->isSecretFile($abs)) {
+            $this->signalerErreurFichier($id, "Ce fichier contient des identifiants : son contenu n'est pas transmis.");
+            return;
+        }
+        $taille = (int) filesize($abs);
+        if ($taille > 524288) {     // 512 Ko : au-dela, l'ecran n'enregistre rien d'utile
+            $this->signalerErreurFichier($id, 'Fichier trop volumineux pour etre affiche ('
+                . $this->humanSize($taille) . ').');
+            return;
+        }
+        $contenu = @file_get_contents($abs);
+        if ($contenu === false) {
+            $this->signalerErreurFichier($id, 'Lecture impossible.');
+            return;
+        }
+        $this->queueCommandResult($id, 'success', null, [
+            'path' => $this->relToRoot($abs),
+            'content' => $contenu,
+            'encoding' => 'utf-8',
+            'size_bytes' => $taille,
+            'modifie' => (int) filemtime($abs),
+        ]);
+    }
+
+    private function opwrite_file($id, $params) {
+        try {
+            $abs = $this->resolveSitePath(isset($params['path']) ? $params['path'] : '');
+        } catch (\RuntimeException $e) {
+            $this->signalerErreurFichier($id, $e->getMessage());
+            return;
+        }
+        if ($this->isSecretFile($abs)) {
+            $this->signalerErreurFichier($id, 'Ce fichier contient des identifiants : SSM ne le modifie pas.');
+            return;
+        }
+        if (is_dir($abs)) {
+            $this->signalerErreurFichier($id, 'Ce chemin est un dossier.');
+            return;
+        }
+        $contenu = isset($params['content']) ? (string) $params['content'] : '';
+        if (strlen($contenu) > 2097152) {   // 2 Mo
+            $this->signalerErreurFichier($id, 'Contenu trop volumineux.');
+            return;
+        }
+        $dossier = dirname($abs);
+        if (!$this->diskWritable($dossier)) {
+            $this->signalerErreurFichier($id, 'Dossier non inscriptible.');
+            return;
+        }
+        // Ecriture atomique : un temporaire puis un renommage. Une ecriture interrompue ne doit
+        // jamais laisser un fichier tronque sur un site de production.
+        $tmp = $abs . '.ssmtmp' . mt_rand(1000, 9999);
+        if (@file_put_contents($tmp, $contenu, LOCK_EX) === false) {
+            $this->signalerErreurFichier($id, 'Ecriture impossible.');
+            return;
+        }
+        if (is_file($abs)) {
+            @chmod($tmp, @fileperms($abs) & 0777);   // un fichier php executable doit le rester
+        }
+        if (!@rename($tmp, $abs)) {
+            @unlink($tmp);
+            $this->signalerErreurFichier($id, 'Remplacement impossible.');
+            return;
+        }
+        clearstatcache(true, $abs);
+        $this->queueCommandResult($id, 'success', null, [
+            'path' => $this->relToRoot($abs),
+            'size_bytes' => (int) filesize($abs),
+            'modifie' => (int) filemtime($abs),
+        ]);
+    }
+
+    private function opmove_file($id, $params) {
+        try {
+            $abs = $this->resolveSitePath(isset($params['path']) ? $params['path'] : '');
+            $vers = $this->resolveSitePath(isset($params['to']) ? $params['to'] : '');
+        } catch (\RuntimeException $e) {
+            $this->signalerErreurFichier($id, $e->getMessage());
+            return;
+        }
+        if (!file_exists($abs)) {
+            $this->signalerErreurFichier($id, 'Source introuvable.');
+            return;
+        }
+        if (file_exists($vers)) {
+            $this->signalerErreurFichier($id, 'La destination existe deja.');
+            return;
+        }
+        if (!$this->diskWritable(dirname($vers))) {
+            $this->signalerErreurFichier($id, 'Dossier de destination non inscriptible.');
+            return;
+        }
+        // `rename` conserve le mode et le proprietaire ; un `copy` suivi d'un `unlink` les perdrait —
+        // et un script de site qui perd son bit executable ne se lance plus.
+        if (@rename($abs, $vers)) {
+            $this->queueCommandResult($id, 'success', null, [
+                'path' => $this->relToRoot($abs), 'to' => $this->relToRoot($vers)]);
+            return;
+        }
+        $this->signalerErreurFichier($id, 'Deplacement impossible.');
+    }
+
+    private function opdelete_file($id, $params) {
+        try {
+            $abs = $this->resolveSitePath(isset($params['path']) ? $params['path'] : '');
+        } catch (\RuntimeException $e) {
+            $this->signalerErreurFichier($id, $e->getMessage());
+            return;
+        }
+        if (rtrim($abs, '/\\') === rtrim($this->fileRoot(), '/\\')) {
+            $this->signalerErreurFichier($id, 'La racine du site ne peut pas etre supprimee.');
+            return;
+        }
+        if (!file_exists($abs)) {
+            $this->signalerErreurFichier($id, 'Fichier introuvable.');
+            return;
+        }
+        if (is_dir($abs)) {
+            // Supprimer un dossier en profondeur sans confirmation prealable serait le pire service a
+            // rendre : on refuse plutot que d'effacer un `themes` d'un geste.
+            $this->signalerErreurFichier($id,
+                "Ce chemin est un dossier : la suppression recursive n'est pas autorisee depuis SSM.");
+            return;
+        }
+        if (!$this->diskWritable(dirname($abs))) {
+            $this->signalerErreurFichier($id, 'Dossier non inscriptible.');
+            return;
+        }
+        if (@unlink($abs)) {
+            $this->queueCommandResult($id, 'success', null, ['path' => $this->relToRoot($abs)]);
+            return;
+        }
+        $this->signalerErreurFichier($id, 'Suppression impossible.');
+    }
+
 
     /**
      * Connexion directe au back-office depuis SSM : fermée par défaut. Un super-administrateur l'ouvre
@@ -1271,6 +1565,26 @@ class Ssmconnector extends Module
         $params = isset($cmd['params']) && is_array($cmd['params']) ? $cmd['params'] : [];
         if ($kind === 'backup_site') {
             $this->backupShop($id, $params);
+            return;
+        }
+        $fichierOps = [
+            'list_files' => 'opListFiles', 'read_file' => 'opReadFile',
+            'write_file' => 'opWriteFile', 'move_file' => 'opMoveFile',
+            'delete_file' => 'opDeleteFile',
+        ];
+        if (isset($fichierOps[$kind])) {
+            // Garde independante de celle de SSM : meme si une demande passe, un connecteur qui
+            // n'annonce pas write_files refuse d'ecrire.
+            if (in_array($kind, ['write_file', 'move_file', 'delete_file'], true)
+                && !in_array('write_files', $this->capabilities(), true)) {
+                $this->queueCommandResult($id, 'failed', "Ce connecteur n'annonce pas write_files.");
+                return;
+            }
+            try {
+                $this->{$fichierOps[$kind]}($id, $params);
+            } catch (\Throwable $e) {
+                $this->queueCommandResult($id, 'failed', $e->getMessage());
+            }
             return;
         }
         if ($kind !== 'plugin_activate' && $kind !== 'plugin_deactivate') {
