@@ -4,7 +4,7 @@
 
 Module natif PrestaShop (8.x, 9.x visé) qui relie la boutique à **SSM Core** (Selest Site Manager) : il lui envoie l'inventaire (modules, thèmes, versions), des compteurs de base et un journal d'événements. Il ne modifie rien dans la boutique.
 
-Version actuelle : **0.5.0** ([notes de version](CHANGELOG.md))
+Version actuelle : **0.10.0** ([notes de version](CHANGELOG.md))
 
 ## Aperçu
 

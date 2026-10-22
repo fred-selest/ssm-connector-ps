@@ -2,6 +2,17 @@
 
 Format inspiré de [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/), versions sémantiques.
 
+## [0.10.0] - 2026-10-13
+
+### Ajouté
+- **Explorateur de fichiers complet** (SSM Core 2.27+) : `list_files`, `read_file`, `write_file`, `move_file`, `delete_file`, et copie de dossiers (`copy_files`). Chaque opération est une commande avec son compte rendu ; les chemins sont résolus à l'intérieur du site, les fichiers de configuration sensibles restent refusés.
+- Script de mise à niveau `upgrade-0.10.0.php` (aucune donnée à migrer ; il évite le bandeau « module à mettre à niveau » et annonce la version à SSM).
+
+## [0.9.0] - 2026-10-13
+
+### Ajouté
+- **Lecture et écriture de fichiers** à la demande de SSM : capacités `read_files` et `write_files` annoncées au heartbeat. Script de mise à niveau `upgrade-0.9.0.php`.
+
 ## [0.8.1] - 2026-10-09
 
 ### Corrigé
